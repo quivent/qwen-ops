@@ -1,0 +1,183 @@
+From 22d4ca1db7c7d96e87da76ffb844757e1ffee1c2 Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 18:09:22 -0400
+Subject: [PATCH] fix(mtp): isolate mtp_graph_compute in a private
+ ggml_backend_sched
+
+---
+ src/llama-context.cpp | 50 ++++++++++++++++++++++++++++---------------
+ src/llama-context.h   |  6 ++++++
+ 2 files changed, 39 insertions(+), 17 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 462962a18..593468f6d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -411,6 +411,13 @@ void llama_context::sched_reserve() {
+ 
+     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+ 
++    // Dedicated scheduler for the MTP draft graph. Uses the same backend
++    // configuration as the main `sched` but keeps its own gallocr so that
++    // state from mtp_graph_compute cannot leak into the main-decode path.
++    if (model.has_mtp_head()) {
++        sched_mtp.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
++    }
++
+     llama_memory_context_ptr mctx;
+     if (memory) {
+         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+@@ -482,6 +489,9 @@ void llama_context::sched_reserve() {
+                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                 cparams.pipeline_parallel = false;
+                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
++                if (model.has_mtp_head()) {
++                    sched_mtp.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
++                }
+                 gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
+             }
+             if (!gf) {
+@@ -2115,6 +2125,13 @@ llm_graph_params llama_context::graph_params(
+ ggml_status llama_context::graph_compute(
+             ggml_cgraph * gf,
+                    bool   batched) {
++    return graph_compute(sched.get(), gf, batched);
++}
++
++ggml_status llama_context::graph_compute(
++            ggml_backend_sched_t sched_arg,
++            ggml_cgraph * gf,
++                   bool   batched) {
+     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
+     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+ 
+@@ -2131,13 +2148,11 @@ ggml_status llama_context::graph_compute(
+         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+     }
+ 
+-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
++    auto status = ggml_backend_sched_graph_compute_async(sched_arg, gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+     }
+ 
+-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+-
+     return status;
+ }
+ 
+@@ -3557,6 +3572,11 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token,
+     if (!gf_res_mtp) {
+         return -4;
+     }
++    if (!sched_mtp) {
++        LLAMA_LOG_ERROR("%s: sched_mtp not initialized\n", __func__);
++        return -4;
++    }
++    ggml_backend_sched_t sched_m = sched_mtp.get();
+ 
+     // Build a one-token ubatch backed by stack-allocated arrays. Only the
+     // fields read by qwen3next's MTP path matter (token, n_tokens, output);
+@@ -3603,7 +3623,7 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token,
+         /*.cparams     =*/ cparams,
+         /*.ubatch      =*/ ubatch,
+         /*.gtype       =*/ LLM_GRAPH_TYPE_MTP,
+-        /*.sched       =*/ sched.get(),
++        /*.sched       =*/ sched_m,
+         /*.backend_cpu =*/ backend_cpu,
+         /*.cvec        =*/ cvec.get(),
+         /*.loras       =*/ loras.get(),
+@@ -3615,7 +3635,7 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token,
+         /*.res         =*/ res,
+     };
+ 
+-    ggml_backend_sched_reset(sched.get());
++    ggml_backend_sched_reset(sched_m);
+ 
+     ggml_cgraph * gf = model.build_graph(gparams);
+     if (!gf) {
+@@ -3624,7 +3644,7 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token,
+         return -4;
+     }
+ 
+-    if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
++    if (!ggml_backend_sched_alloc_graph(sched_m, gf)) {
+         this->n_outputs = saved_n_outputs;
+         LLAMA_LOG_ERROR("%s: failed to allocate MTP graph\n", __func__);
+         return -4;
+@@ -3669,7 +3689,7 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token,
+         ggml_backend_tensor_set(res->t_mtp_pos_zero_in, zeros.data(), 0, zbytes);
+     }
+ 
+-    const auto status = graph_compute(gf, /*batched=*/false);
++    const auto status = graph_compute(sched_m, gf, /*batched=*/false);
+     if (status != GGML_STATUS_SUCCESS) {
+         this->n_outputs = saved_n_outputs;
+         LLAMA_LOG_ERROR("%s: MTP graph compute failed, status = %d\n", __func__, status);
+@@ -3691,7 +3711,7 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token,
+     }
+     const int64_t copy_vocab = std::min<int64_t>(produced_vocab, n_vocab);
+ 
+-    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_m, t_logits);
+     if (backend_res == nullptr) {
+         this->n_outputs = saved_n_outputs;
+         LLAMA_LOG_ERROR("%s: MTP logits tensor has no backend\n", __func__);
+@@ -3700,25 +3720,21 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token,
+     ggml_backend_tensor_get_async(backend_res, t_logits, out_logits, 0, copy_vocab * sizeof(float));
+ 
+     // Pull the MTP layer's output hidden state back to the caller's buffer
+-    // so the next chained draft step can use it as prev_hidden. This is the
+-    // correctness fix for the K>1 "only first draft accepted" bug.
++    // so the next chained draft step can use it as prev_hidden.
+     if (out_hidden != nullptr && res->t_mtp_out_hidden != nullptr) {
+-        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_mtp_out_hidden);
++        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_m, res->t_mtp_out_hidden);
+         if (backend_h != nullptr) {
+             const size_t nb = ggml_nbytes(res->t_mtp_out_hidden);
+             ggml_backend_tensor_get_async(backend_h, res->t_mtp_out_hidden, out_hidden, 0, nb);
+         }
+     }
+ 
+-    ggml_backend_sched_synchronize(sched.get());
++    ggml_backend_sched_synchronize(sched_m);
+ 
+     this->n_outputs = saved_n_outputs;
+ 
+-    // The next main decode will rebuild its own graph in gf_res_prev — our
+-    // separate gf_res_mtp keeps state isolated. We still reset the scheduler
+-    // so the next call to process_ubatch starts cleanly.
+-    ggml_backend_sched_reset(sched.get());
+-
++    // Main-decode `sched` is untouched: MTP runs entirely on `sched_mtp`,
++    // so there is no scheduler state to clear on the main sched here.
+     return 0;
+ }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index ca0f1f20a..1379647a4 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -237,6 +237,7 @@ public:
+ 
+     // returns the result of ggml_backend_sched_graph_compute_async execution
+     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
++    ggml_status graph_compute(ggml_backend_sched_t sched_arg, ggml_cgraph * gf, bool batched);
+ 
+     // reserve a graph with a dummy ubatch of the specified size
+     ggml_cgraph * graph_reserve(
+@@ -350,6 +351,11 @@ private:
+ 
+     ggml_backend_sched_ptr sched;
+ 
++    // Private scheduler dedicated to the MTP draft graph. Kept separate from
++    // `sched` so that main-decode and MTP graph allocations never share
++    // gallocr state. Only allocated when the model has an MTP head.
++    ggml_backend_sched_ptr sched_mtp;
++
+     bool sched_need_reserve = true;
+ 
+     ggml_backend_t backend_cpu = nullptr;
+-- 
+2.51.2
+

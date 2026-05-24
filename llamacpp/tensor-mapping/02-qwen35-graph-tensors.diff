@@ -1,0 +1,209 @@
+commit 83babcae7a23045dd5c2c7ab4ddb9e8f3c3145d0
+Author: quivent <quivent@users.noreply.github.com>
+Date:   Wed Apr 8 16:39:37 2026 -0400
+
+    qwen35: add MTP draft-graph path mirroring qwen3next
+    
+    Adds build_mtp_head and the LLM_GRAPH_TYPE_MTP early-return branch
+    to llm_build_qwen35 so the dispatcher in llama_context::mtp_graph_compute
+    can run the NextN head for Qwen3.5 models with nextn_predict_layers > 0.
+    
+    The head follows the MLX reference in ~/mlx-fork/fused_gdn.py MTPHead:
+    enorm(embed), hnorm(hidden), concat [embed, hidden] (embed-first is the
+    critical eh_proj order), eh_proj down to n_embd, one gated self-attention
+    block with q/k norms and RoPE at pos 0, dense SiLU MLP, shared_head_norm,
+    then shared_head_head projection to vocab.
+    
+    Qwen3.5 MTP layer 64 is dense full-attention, so the FFN uses
+    layer.ffn_{gate,up,down} and attention uses layer.w{q,k,v,o} with the *2
+    gating factor on wq. Exports res->t_mtp_prev_hidden_in and
+    res->t_mtp_pos_zero_in for dispatcher upload.
+    
+    TODO(dedupe): share with llm_build_qwen3next::build_mtp_head.
+
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 56eefd7de..ef324aef0 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -14,6 +14,32 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
++    // MTP draft graph: skip the full forward pass and run only the NextN
++    // (MTP) head over a single seed token plus the previous hidden state.
++    // The host buffer behind `prev_hidden` is uploaded by
++    // llama_context::mtp_graph_compute via res->t_mtp_prev_hidden_in.
++    if (gtype == LLM_GRAPH_TYPE_MTP) {
++        GGML_ASSERT(hparams.nextn_predict_layers > 0 && "MTP graph requested but model has no NextN layers");
++        GGML_ASSERT(ubatch.n_tokens == 1 && "MTP graph expects a single seed token per dispatch");
++
++        ggml_tensor * tok_embed = build_inp_embd(model.tok_embd);
++        cb(tok_embed, "mtp_tok_embed", -1);
++
++        ggml_tensor * prev_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, 1);
++        ggml_set_input(prev_hidden);
++        res->t_mtp_prev_hidden_in = prev_hidden;
++        cb(prev_hidden, "mtp_prev_hidden", -1);
++
++        const int il_mtp = (int) (n_layer - hparams.nextn_predict_layers);
++
++        ggml_tensor * mtp_logits = build_mtp_head(prev_hidden, tok_embed, il_mtp, nullptr);
++        cb(mtp_logits, "result_output", -1);
++        res->t_logits = mtp_logits;
++
++        ggml_build_forward_expand(gf, mtp_logits);
++        return;
++    }
++
+     inpL = build_inp_embd(model.tok_embd);
+ 
+     cb(inpL, "model.input_embed", -1);
+@@ -369,6 +395,148 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
+     return cur;
+ }
+ 
++ggml_tensor * llm_build_qwen35::build_mtp_head(
++        ggml_tensor *  prev_hidden,
++        ggml_tensor *  tok_embed,
++                  int  il_mtp,
++        ggml_tensor ** out_hidden) {
++    // Reference: MTPHead.__call__ in ~/mlx-fork/fused_gdn.py
++    // See llm_build_qwen3next::build_mtp_head for the annotated port.
++    // TODO(dedupe): share implementation with llm_build_qwen3next.
++    //
++    // For Qwen3.5 the MTP layer is dense full-attention (non-recurrent):
++    // attn uses layer.wq/wk/wv/wo with a *2 gating factor on wq, and the
++    // FFN uses the dense ffn_gate/ffn_up/ffn_down slots.
++
++    const auto & layer = model.layers[il_mtp];
++
++    GGML_ASSERT(layer.nextn.enorm            && "MTP enorm missing");
++    GGML_ASSERT(layer.nextn.hnorm            && "MTP hnorm missing");
++    GGML_ASSERT(layer.nextn.eh_proj          && "MTP eh_proj missing");
++    GGML_ASSERT(layer.nextn.shared_head_norm && "MTP shared_head_norm missing");
++    GGML_ASSERT(layer.nextn.shared_head_head && "MTP shared_head_head missing");
++
++    const int64_t n_embd_head = hparams.n_embd_head_v;
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
++
++    // --- 1. Norm + concat + project ---
++    ggml_tensor * h_norm = build_norm(prev_hidden, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(h_norm, "mtp_h_norm", il_mtp);
++
++    ggml_tensor * e_norm = build_norm(tok_embed, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(e_norm, "mtp_e_norm", il_mtp);
++
++    // Concat along the feature dim: [e; h] -> [2*n_embd, 1]
++    // NOTE (CRITICAL): embed first, hidden second. Matches GGUF "eh_proj" name.
++    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, 0);
++    cb(concat, "mtp_eh_concat", il_mtp);
++
++    ggml_tensor * h = build_lora_mm(layer.nextn.eh_proj, concat);
++    cb(h, "mtp_fc_out", il_mtp);
++
++    // --- 2. Gated self-attention (single token, no past cache, no mask) ---
++    ggml_tensor * residual = h;
++    ggml_tensor * h_attn = build_norm(h, layer.attn_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(h_attn, "mtp_attn_norm", il_mtp);
++
++    // Q projection produces [Q | gate] interleaved per-head
++    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, h_attn);
++    cb(Qcur_full, "mtp_Qcur_full", il_mtp);
++
++    Qcur_full = ggml_reshape_4d(ctx0, Qcur_full, n_embd_head * 2, n_head, 1, 1);
++
++    ggml_tensor * Qcur = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, 1, 1,
++                                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], 0);
++    ggml_tensor * gate = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, 1, 1,
++                                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3],
++                                      n_embd_head * ggml_element_size(Qcur_full));
++
++    ggml_tensor * Kcur = build_lora_mm(layer.wk, h_attn);
++    ggml_tensor * Vcur = build_lora_mm(layer.wv, h_attn);
++
++    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, 1);
++    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, 1);
++
++    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il_mtp);
++
++    // RoPE at position 0. At pos=0, RoPE is identity so MRoPE sections do
++    // not matter here — use the simpler ggml_rope_ext path.
++    ggml_tensor * inp_pos_zero = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++    ggml_set_input(inp_pos_zero);
++    res->t_mtp_pos_zero_in = inp_pos_zero;
++
++    Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos_zero, nullptr,
++            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++            ext_factor, attn_factor, beta_fast, beta_slow);
++    Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos_zero, nullptr,
++            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++            ext_factor, attn_factor, beta_fast, beta_slow);
++    cb(Qcur, "mtp_Qcur", il_mtp);
++    cb(Kcur, "mtp_Kcur", il_mtp);
++    cb(Vcur, "mtp_Vcur", il_mtp);
++
++    const float kq_scale = hparams.f_attention_scale == 0.0f
++        ? 1.0f / sqrtf(float(n_embd_head))
++        : hparams.f_attention_scale;
++
++    if (n_head_kv != n_head) {
++        GGML_ASSERT(n_head % n_head_kv == 0);
++        const int64_t rep = n_head / n_head_kv;
++        Kcur = ggml_repeat_4d(ctx0, Kcur, n_embd_head, rep, n_head_kv, 1);
++        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head, 1);
++        Vcur = ggml_repeat_4d(ctx0, Vcur, n_embd_head, rep, n_head_kv, 1);
++        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head, 1);
++    }
++
++    ggml_tensor * KQ = ggml_mul_mat(ctx0, Kcur, Qcur);
++    KQ = ggml_scale(ctx0, KQ, kq_scale);
++    KQ = ggml_soft_max(ctx0, KQ);
++
++    ggml_tensor * KQV = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Vcur)), KQ);
++    ggml_tensor * attn_out = ggml_reshape_2d(ctx0, KQV, n_embd_head * n_head, 1);
++    cb(attn_out, "mtp_attn_pregate", il_mtp);
++
++    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, 1);
++    gate = ggml_sigmoid(ctx0, gate);
++    attn_out = ggml_mul(ctx0, attn_out, gate);
++
++    attn_out = build_lora_mm(layer.wo, attn_out);
++    cb(attn_out, "mtp_attn_out", il_mtp);
++
++    h = ggml_add(ctx0, residual, attn_out);
++
++    // --- 3. Dense MLP ---
++    residual = h;
++    ggml_tensor * h_mlp_norm = build_norm(h, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(h_mlp_norm, "mtp_mlp_norm", il_mtp);
++
++    GGML_ASSERT(layer.ffn_up && layer.ffn_gate && layer.ffn_down
++                && "Qwen3.5 MTP head requires dense FFN weights");
++    ggml_tensor * mlp_out = build_ffn(h_mlp_norm,
++        layer.ffn_up,   NULL, NULL,
++        layer.ffn_gate, NULL, NULL,
++        layer.ffn_down, NULL, NULL,
++        NULL,
++        LLM_FFN_SILU, LLM_FFN_PAR, il_mtp);
++    cb(mlp_out, "mtp_mlp_out", il_mtp);
++
++    h = ggml_add(ctx0, residual, mlp_out);
++
++    if (out_hidden) {
++        *out_hidden = h;
++    }
++
++    // --- 4. Final norm + shared lm head ---
++    ggml_tensor * h_final = build_norm(h, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(h_final, "mtp_final_norm", il_mtp);
++
++    ggml_tensor * logits = build_lora_mm(layer.nextn.shared_head_head, h_final);
++    cb(logits, "mtp_logits", il_mtp);
++
++    return logits;
++}
++
+ ggml_tensor * llm_build_qwen35::build_layer_ffn(ggml_tensor * cur, const int il) {
+     // Qwen3.5 does not use MoE FFN
+     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);

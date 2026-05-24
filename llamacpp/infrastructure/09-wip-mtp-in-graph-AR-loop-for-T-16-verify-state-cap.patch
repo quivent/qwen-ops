@@ -1,0 +1,158 @@
+From 987541157bc23e820f2010bebc501f358ddf315a Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 19:31:29 -0400
+Subject: [PATCH] wip(mtp): in-graph AR loop for T<=16 verify + state capture
+ diag
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In-graph split for the DeltaNet recurrence under MTP_VERIFY_FORCE_AR=1:
+loop build_delta_net_autoregressive per token while keeping input/output
+projections batched. Gated on n_seq_tokens<=16 so sched_reserve (full
+n_batch) still picks chunking and sizes compute buffers correctly.
+
+Investigation status: chunking and the AR loop produce the same iter 1-3
+draft/target IDs on the test prompt, so "chunking vs AR numerical drift"
+is NOT the root cause of the MTP accept-rate collapse. The real drift
+source is still TBD — current evidence points at mtp_prev_hidden capture
+in rollback re-decodes producing subtly different hidden states than a
+fresh sequential decode would, even though the main-model logits match.
+
+Adds MTP_DEBUG_CAPTURE=1 env var to dump mtp_prev_hidden checksums after
+each llama_decode so drift can be bisected across iterations.
+
+Adds a debug print at the top of the AR loop to confirm the path is
+actually being taken.
+
+Pending: either finish root-causing the drift (narrow window for
+correctness fix) or pivot to MTP variant exploration (altered heads,
+predictive hidden state, branching, evolving strategies).
+---
+ src/llama-context.cpp | 23 +++++++++++++++
+ src/models/qwen35.cpp | 66 ++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 114464ca7..83d228620 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1754,12 +1754,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 const int64_t mtp_n_embd  = t_embd_for_mtp->ne[0];
+                 const int64_t mtp_n_toks  = t_embd_for_mtp->ne[1];
+                 const int64_t mtp_last    = mtp_n_toks > 0 ? mtp_n_toks - 1 : 0;
++                if (std::getenv("MTP_DEBUG_CAPTURE") != nullptr) {
++                    fprintf(stderr, "[MTP_CAPTURE] n_embd=%lld n_toks=%lld last_idx=%lld offset_bytes=%zu\n",
++                            (long long) mtp_n_embd, (long long) mtp_n_toks, (long long) mtp_last,
++                            (size_t) (mtp_last * mtp_n_embd) * sizeof(float));
++                }
+                 mtp_prev_hidden.resize((size_t) mtp_n_embd);
+                 ggml_backend_tensor_get_async(backend_mtp, t_embd_for_mtp,
+                     mtp_prev_hidden.data(),
+                     (size_t) (mtp_last * mtp_n_embd) * sizeof(float),
+                     (size_t) mtp_n_embd * sizeof(float));
+                 mtp_prev_hidden_valid = true;
++                if (std::getenv("MTP_DEBUG_CAPTURE") != nullptr) {
++                    // Need the backend copy to complete before reading host buffer.
++                    ggml_backend_sched_synchronize(sched.get());
++                    double s0 = 0.0, s1 = 0.0, s2 = 0.0;
++                    for (size_t j = 0; j < mtp_prev_hidden.size(); ++j) {
++                        s0 += mtp_prev_hidden[j];
++                        s1 += (double) mtp_prev_hidden[j] * (double) mtp_prev_hidden[j];
++                    }
++                    if (mtp_prev_hidden.size() > 0) {
++                        s2 = s1 / mtp_prev_hidden.size();
++                    }
++                    fprintf(stderr, "[MTP_CAPTURE] sum=%.4f sumsq=%.4f meansq=%.6f first4=%.4f,%.4f,%.4f,%.4f\n",
++                            s0, s1, s2,
++                            mtp_prev_hidden.size() > 0 ? mtp_prev_hidden[0] : 0.0f,
++                            mtp_prev_hidden.size() > 1 ? mtp_prev_hidden[1] : 0.0f,
++                            mtp_prev_hidden.size() > 2 ? mtp_prev_hidden[2] : 0.0f,
++                            mtp_prev_hidden.size() > 3 ? mtp_prev_hidden[3] : 0.0f);
++                }
+             }
+         }
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index fae8fecd7..8bb412d04 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -371,10 +371,74 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
+     cb(k_conv, "k_conv_predelta", il);
+     cb(v_conv, "v_conv_predelta", il);
+ 
+-    // Choose between build_delta_net_chunking, build_delta_net_recurrent, and build_delta_net_autoregressive based on n_tokens
++    // Choose between build_delta_net_chunking, build_delta_net_recurrent, and build_delta_net_autoregressive based on n_tokens.
++    //
++    // When MTP_VERIFY_FORCE_AR=1, force the T>1 path through a loop of T=1
++    // autoregressive calls instead of the chunking kernel. Chunking and AR
++    // are mathematically equivalent but numerically diverge in fp16/fp32,
++    // which corrupts MTP speculative decoding over multiple verify iterations
++    // (hidden-state drift → main-model argmax flips → accept rate collapses).
++    // Looping AR keeps matmul batching for input/output projections while
++    // serializing the recurrence at T=1 so it's bit-exact with a sequential
++    // decode. Cost is slightly more recurrence work; correctness is preserved.
+     std::pair<ggml_tensor *, ggml_tensor *> attn_out; // pair of (output, new_state)
+     if (n_seq_tokens == 1) {
+         attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, il);
++    } else if (n_seq_tokens <= 16 && std::getenv("MTP_VERIFY_FORCE_AR") != nullptr) {
++        // Gate the loop on small T so the sched_reserve pass (which uses
++        // n_tokens = n_batch, often 2048+) still goes through the chunking
++        // kernel and sizes compute buffers for the worst-case fast path.
++        // MTP verify batches are K+1 tokens; K=1 verifies at T=2, K=3 at T=4.
++        static int dbg_count = 0;
++        if (dbg_count++ < 3) {
++            fprintf(stderr, "[AR LOOP] il=%d n_seq_tokens=%lld n_seqs=%lld\n",
++                    il, (long long) n_seq_tokens, (long long) n_seqs);
++        }
++        ggml_tensor * state_running = state;
++        std::vector<ggml_tensor *> outs;
++        outs.reserve((size_t) n_seq_tokens);
++        for (int64_t t = 0; t < n_seq_tokens; ++t) {
++            ggml_tensor * q_t = ggml_view_4d(ctx0, q_conv,
++                q_conv->ne[0], q_conv->ne[1], 1, q_conv->ne[3],
++                q_conv->nb[1], q_conv->nb[2], q_conv->nb[3],
++                (size_t) t * q_conv->nb[2]);
++            ggml_tensor * k_t = ggml_view_4d(ctx0, k_conv,
++                k_conv->ne[0], k_conv->ne[1], 1, k_conv->ne[3],
++                k_conv->nb[1], k_conv->nb[2], k_conv->nb[3],
++                (size_t) t * k_conv->nb[2]);
++            ggml_tensor * v_t = ggml_view_4d(ctx0, v_conv,
++                v_conv->ne[0], v_conv->ne[1], 1, v_conv->ne[3],
++                v_conv->nb[1], v_conv->nb[2], v_conv->nb[3],
++                (size_t) t * v_conv->nb[2]);
++            ggml_tensor * g_t = ggml_view_4d(ctx0, gate,
++                gate->ne[0], gate->ne[1], 1, gate->ne[3],
++                gate->nb[1], gate->nb[2], gate->nb[3],
++                (size_t) t * gate->nb[2]);
++            ggml_tensor * b_t = ggml_view_4d(ctx0, beta,
++                beta->ne[0], beta->ne[1], 1, beta->ne[3],
++                beta->nb[1], beta->nb[2], beta->nb[3],
++                (size_t) t * beta->nb[2]);
++            // Contiguous copies so the AR kernel can use them without stride assumptions.
++            q_t = ggml_cont(ctx0, q_t);
++            k_t = ggml_cont(ctx0, k_t);
++            v_t = ggml_cont(ctx0, v_t);
++            g_t = ggml_cont(ctx0, g_t);
++            b_t = ggml_cont(ctx0, b_t);
++
++            auto step = build_delta_net_autoregressive(q_t, k_t, v_t, g_t, b_t, state_running, il);
++            outs.push_back(step.first);
++            // AR returns a transposed view of the new state; force contiguous
++            // so the next iteration's ggml_mul doesn't hit the nb[0]==sizeof
++            // contiguity assertion.
++            state_running = ggml_cont(ctx0, step.second);
++        }
++        // Concatenate per-token outputs along the token dimension (index 2).
++        ggml_tensor * concat_out = outs[0];
++        for (size_t i = 1; i < outs.size(); ++i) {
++            concat_out = ggml_concat(ctx0, concat_out, outs[i], 2);
++        }
++        attn_out.first  = concat_out;
++        attn_out.second = state_running;
+     } else {
+         attn_out = build_delta_net_chunking(q_conv, k_conv, v_conv, gate, beta, state, il);
+     }
+-- 
+2.51.2
+

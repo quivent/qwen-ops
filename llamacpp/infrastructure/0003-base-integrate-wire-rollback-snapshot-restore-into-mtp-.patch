@@ -1,0 +1,116 @@
+From 7afb0b6804ea723fb1f249aa0397c50f15ba94c1 Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 14:12:37 -0400
+Subject: [PATCH] integrate: wire rollback snapshot/restore into
+ mtp-speculative
+
+---
+ common/speculative-mtp.cpp                   | 13 +++---
+ examples/mtp-speculative/mtp-speculative.cpp | 44 ++++++++++++++++----
+ 2 files changed, 42 insertions(+), 15 deletions(-)
+
+diff --git a/common/speculative-mtp.cpp b/common/speculative-mtp.cpp
+index ff24b49c7..22c7fdbbe 100644
+--- a/common/speculative-mtp.cpp
++++ b/common/speculative-mtp.cpp
+@@ -123,14 +123,11 @@ void common_speculative_mtp_accept(
+     spec->stats.rejected_tokens += (size_t) (n_drafted - n_accepted);
+ 
+     if (n_accepted < n_drafted) {
+-        // TODO(rollback): when the DeltaNet recurrent-state rollback agent
+-        // lands, invoke the rollback hook here to restore the target
+-        // context's recurrent state to the checkpoint captured just before
+-        // the rejected draft position. For now this is a no-op: the caller
+-        // is responsible for trimming the KV cache via llama_memory_seq_rm
+-        // and for re-decoding the corrected token — which works correctly
+-        // for attention-only layers and is the "full re-verify" fallback
+-        // documented in the task brief.
++        // The caller is responsible for invoking
++        // llama_memory_restore_recurrent() against a snapshot captured
++        // before the verify pass, then trimming the KV cache via
++        // llama_memory_seq_rm(), then re-decoding the corrected token.
++        // This helper only records the rollback for stats purposes.
+         spec->stats.rollbacks++;
+     }
+ }
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+index b42fd537a..c063d3ada 100644
+--- a/examples/mtp-speculative/mtp-speculative.cpp
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -186,9 +186,22 @@ int main(int argc, char ** argv) {
+             verify_batch.logits[1 + i]    = 1;
+         }
+ 
+-        // Step 3: forward pass on all K+1 tokens.
++        // Step 3: snapshot the recurrent (DeltaNet) state BEFORE the verify
++        // forward pass so we can roll it back on rejection. This is a no-op
++        // for non-recurrent models (returns 0 with a NULL handle).
++        llama_memory_recurrent_snapshot_t snap = nullptr;
++        const int32_t snap_rc = llama_memory_snapshot_recurrent(ctx_tgt, &snap);
++        if (snap_rc != 0) {
++            LOG_ERR("%s: recurrent snapshot failed (rc=%d)\n", __func__, snap_rc);
++            // Continue without rollback support — KV trim will still work
++            // for the attention layers; recurrent state will drift on reject.
++            snap = nullptr;
++        }
++
++        // Step 4: forward pass on all K+1 tokens.
+         if (llama_decode(ctx_tgt, verify_batch) != 0) {
+             LOG_ERR("%s: verification decode failed\n", __func__);
++            llama_memory_release_snapshot(snap);
+             break;
+         }
+         common_speculative_mtp_note_forward_pass(spec);
+@@ -228,12 +241,21 @@ int main(int argc, char ** argv) {
+             //   kept: [0 .. n_past + n_accepted]  (id_last + n_accepted drafts)
+             //   drop: (n_past + n_accepted .. n_past + n_drafted]
+             //
+-            // TODO(rollback): once the DeltaNet recurrent-state rollback
+-            // agent lands, invoke the rollback hook here BEFORE trimming
+-            // so DeltaNet layers' recurrent state is restored to the
+-            // checkpoint captured at position (n_past + n_accepted).
+-            // Until then, for attention-only layers this KV trim is the
+-            // full-re-verify fallback and is correct by itself.
++            // Restore DeltaNet recurrent state to the checkpoint captured
++            // before the verify pass. This rewinds split-recurrence layers
++            // to their state at position n_past, just as
++            // llama_memory_seq_rm rewinds the attention-layer KV cache for
++            // positions > keep_end. Together they reconstruct the cache
++            // state we'd have had if only the accepted prefix had been
++            // decoded. The correction-token decode below then advances
++            // both halves by exactly one position.
++            if (snap != nullptr) {
++                const int32_t rrc = llama_memory_restore_recurrent(ctx_tgt, snap);
++                if (rrc != 0) {
++                    LOG_ERR("%s: recurrent restore failed (rc=%d)\n", __func__, rrc);
++                }
++            }
++
+             const llama_pos keep_end = n_past + 1 + n_accepted;
+             llama_memory_seq_rm(mem_tgt, 0, keep_end, -1);
+ 
+@@ -248,6 +270,8 @@ int main(int argc, char ** argv) {
+             verify_batch.logits[0]    = 1;
+             if (llama_decode(ctx_tgt, verify_batch) != 0) {
+                 LOG_ERR("%s: correction decode failed\n", __func__);
++                llama_memory_release_snapshot(snap);
++                snap = nullptr;
+                 break;
+             }
+             common_speculative_mtp_note_forward_pass(spec);
+@@ -269,6 +293,12 @@ int main(int argc, char ** argv) {
+             id_last = nt;
+         }
+ 
++        // Release the verify-pass snapshot. On accept it represents stale
++        // pre-verify state; on reject we've already restored from it. Either
++        // way it's safe to drop now.
++        llama_memory_release_snapshot(snap);
++        snap = nullptr;
++
+         if (id_last == eos_tok) {
+             break;
+         }
+-- 
+2.51.2
+

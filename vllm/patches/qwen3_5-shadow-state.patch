@@ -1,0 +1,101 @@
+--- vllm/model_executor/models/qwen3_5.py	2026-04-02 23:48:30.000000000 +0000
++++ /home/ubuntu/.local/lib/python3.10/site-packages/vllm/model_executor/models/qwen3_5.py	2026-04-11 09:54:32.650768010 +0000
+@@ -247,6 +247,98 @@
+ 
+         self.aux_hidden_state_layers: tuple[int, ...] = ()
+ 
++    def set_draft_mode(self, enabled: bool):
++        """Toggle draft mode: skip attention layers, run DeltaNet only."""
++        for layer in self.layers:
++            if hasattr(layer, 'layer_type') and layer.layer_type == "full_attention":
++                layer._skip_attention = enabled
++
++    def snapshot_deltanet_state(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
++        """Snapshot DeltaNet conv + temporal state for all recurrent layers.
++
++        Returns a list of (conv_state_clone, ssm_state_clone) per layer.
++        Call before draft mode to preserve the verified state.
++        """
++        if not hasattr(self, '_deltanet_snapshot_buf'):
++            # First call: allocate persistent snapshot buffers
++            self._deltanet_snapshot_buf = []
++            for layer in self.layers:
++                if hasattr(layer, 'layer_type') and layer.layer_type == "linear_attention":
++                    la = layer.linear_attn
++                    if not hasattr(la, 'kv_cache') or la.kv_cache is None:
++                        continue
++                    kv_cache = la.kv_cache
++                    if isinstance(kv_cache, (list, tuple)) and len(kv_cache) >= 2:
++                        self._deltanet_snapshot_buf.append(
++                            (kv_cache[0].clone(), kv_cache[1].clone()))
++        else:
++            # Subsequent calls: copy into pre-allocated buffers
++            idx = 0
++            for layer in self.layers:
++                if hasattr(layer, 'layer_type') and layer.layer_type == "linear_attention":
++                    la = layer.linear_attn
++                    if not hasattr(la, 'kv_cache') or la.kv_cache is None:
++                        continue
++                    kv_cache = la.kv_cache
++                    if isinstance(kv_cache, (list, tuple)) and len(kv_cache) >= 2:
++                        self._deltanet_snapshot_buf[idx][0].copy_(kv_cache[0])
++                        self._deltanet_snapshot_buf[idx][1].copy_(kv_cache[1])
++                        idx += 1
++        return self._deltanet_snapshot_buf
++
++    def restore_deltanet_state(
++        self, snapshots: list[tuple[torch.Tensor, torch.Tensor]]
++    ):
++        """Restore DeltaNet state from a prior snapshot.
++
++        Call after draft mode, before verify, to reset recurrent
++        state to the last verified position.
++        """
++        idx = 0
++        for layer in self.layers:
++            if hasattr(layer, 'layer_type') and layer.layer_type == "linear_attention":
++                kv_cache = layer.linear_attn.kv_cache
++                kv_cache[0].copy_(snapshots[idx][0])
++                kv_cache[1].copy_(snapshots[idx][1])
++                idx += 1
++
++    def setup_draft_shadow_state(self, state_indices: torch.Tensor):
++        """Create shadow DeltaNet state caches for draft-mode forward.
++
++        The shadow caches are small tensors (batch_size slots) populated
++        from the real cache.  During draft mode, GDN layers write to
++        these instead of the real cache, preventing state corruption.
++
++        Args:
++            state_indices: 1-D int tensor of real slot IDs to copy from.
++        """
++        n = state_indices.shape[0]
++        for layer in self.layers:
++            if not (hasattr(layer, 'layer_type')
++                    and layer.layer_type == "linear_attention"):
++                continue
++            la = layer.linear_attn
++            if not hasattr(la, 'kv_cache') or la.kv_cache is None:
++                continue
++            kv_cache = la.kv_cache
++            if not (isinstance(kv_cache, (list, tuple)) and len(kv_cache) >= 2):
++                continue
++            # Clone the relevant slots into a contiguous shadow cache
++            # indexed 0..n-1 (not by real slot ID)
++            conv_shadow = kv_cache[0][state_indices].clone()
++            ssm_shadow = kv_cache[1][state_indices].clone()
++            la._draft_kv_cache = [conv_shadow, ssm_shadow]
++
++    def clear_draft_shadow_state(self):
++        """Discard shadow caches, restoring GDN layers to use real cache."""
++        for layer in self.layers:
++            if not (hasattr(layer, 'layer_type')
++                    and layer.layer_type == "linear_attention"):
++                continue
++            la = layer.linear_attn
++            if hasattr(la, '_draft_kv_cache'):
++                la._draft_kv_cache = None
++
+     def load_fused_expert_weights(
+         self,
+         name: str,

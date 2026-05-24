@@ -1,0 +1,24 @@
+--- a/awq/quantize/quantizer.py
++++ b/awq/quantize/quantizer.py
+@@ -159,7 +159,12 @@
+             if (
+                 transformers.__version__ >= "4.48.0"
+                 and self.module_kwargs.get("position_embeddings") is None
+             ):
+-                self.module_kwargs["position_embeddings"] = self.model.model.rotary_emb(
++                # Support both standard path and nested language_model path (Qwen3.5)
++                if hasattr(self.model.model, "rotary_emb"):
++                    _rotary_emb = self.model.model.rotary_emb
++                else:
++                    _rotary_emb = self.model.model.language_model.rotary_emb
++                self.module_kwargs["position_embeddings"] = _rotary_emb(
+                     self.inps, self.module_kwargs["position_ids"]
+                 )
+
+@@ -523,6 +528,9 @@
+
+         oc_batch_size = 256 if org_w_shape[0] % 256 == 0 else 64  # prevent OOM
++        if org_w_shape[0] % oc_batch_size != 0:
++            # Fall back for small layers (e.g. GDN in_proj_b with 48 out_features)
++            oc_batch_size = org_w_shape[0]
+         assert org_w_shape[0] % oc_batch_size == 0

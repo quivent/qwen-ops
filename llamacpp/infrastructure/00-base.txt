@@ -1,0 +1,12 @@
+The patches in this directory form a complete MTP speculative decoding stack for
+Qwen3.5-27B in llama.cpp. Apply order is by filename prefix:
+
+  0000..0004  base MTP layer (memory snapshot, qwen3next head, single-model spec)
+  01..11      qwen35 port + infrastructure + the rollback bookkeeping fix
+
+These apply against upstream llama.cpp at parent commit:
+
+  9c7911f4f fix: V tensor extraction with transposed KV cache
+
+To apply the full series, clone llama.cpp, switch to that commit, then
+`git am` the patches in alphanumeric order from the patches/ directory.

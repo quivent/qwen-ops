@@ -1,0 +1,104 @@
+--- /home/ubuntu/.local/lib/python3.10/site-packages/vllm/config/speculative.py.bak	2026-04-11 08:49:37.820135724 +0000
++++ /home/ubuntu/.local/lib/python3.10/site-packages/vllm/config/speculative.py	2026-04-11 09:41:23.445155381 +0000
+@@ -66,6 +66,11 @@
+ class SpeculativeConfig:
+     """Configuration for speculative decoding."""
+ 
++    # Class-level flag: when True, hf_config_override skips converting
++    # qwen3_5 -> qwen3_5_mtp. Set temporarily during standalone draft
++    # model construction so a separate draft model keeps its own arch.
++    _skip_mtp_conversion: bool = False
++
+     enforce_eager: bool | None = None
+     """Override the default enforce_eager from model_config"""
+     # General speculative decoding control
+@@ -323,15 +328,22 @@
+             )
+ 
+         if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
+-            is_moe = hf_config.model_type == "qwen3_5_moe"
+-            hf_config.model_type = "qwen3_5_mtp"
+-            n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+-            hf_config.update(
+-                {
+-                    "n_predict": n_predict,
+-                    "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
+-                }
+-            )
++            # Only convert to MTP variant for self-speculative decoding
++            # (extracting MTP head from target model). Skip for standalone
++            # draft models, signalled by _skip_mtp_conversion class flag.
++            if not getattr(SpeculativeConfig, '_skip_mtp_conversion', False):
++                is_moe = hf_config.model_type == "qwen3_5_moe"
++                hf_config.model_type = "qwen3_5_mtp"
++                n_predict = getattr(hf_config, "mtp_num_hidden_layers",
++                                    None)
++                hf_config.update(
++                    {
++                        "n_predict": n_predict,
++                        "architectures": [
++                            "Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"
++                        ],
++                    }
++                )
+         if hf_config.model_type == "longcat_flash":
+             hf_config.model_type = "longcat_flash_mtp"
+             n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+@@ -491,26 +503,38 @@
+             self.prompt_lookup_min = 0
+ 
+             if self.model is not None:
+-                self.draft_model_config = ModelConfig(
+-                    model=self.model,
+-                    runner="draft",
+-                    tokenizer=self.target_model_config.tokenizer,
+-                    tokenizer_mode=self.target_model_config.tokenizer_mode,
+-                    trust_remote_code=self.target_model_config.trust_remote_code,
+-                    allowed_local_media_path=self.target_model_config.allowed_local_media_path,
+-                    allowed_media_domains=self.target_model_config.allowed_media_domains,
+-                    dtype=self.target_model_config.dtype,
+-                    seed=self.target_model_config.seed,
+-                    revision=self.revision,
+-                    code_revision=self.code_revision,
+-                    tokenizer_revision=self.target_model_config.tokenizer_revision,
+-                    spec_target_max_model_len=self.target_model_config.max_model_len,
+-                    quantization=self.quantization,
+-                    enforce_eager=self.target_model_config.enforce_eager,
+-                    max_logprobs=self.target_model_config.max_logprobs,
+-                    hf_overrides=SpeculativeConfig.hf_config_override,
+-                    config_format=self.target_model_config.config_format,
++                # For standalone draft models (different path from target),
++                # skip MTP model_type conversions so the draft keeps its
++                # original architecture.
++                is_standalone_draft = (
++                    self.target_model_config is not None
++                    and self.model != self.target_model_config.model
+                 )
++                if is_standalone_draft:
++                    SpeculativeConfig._skip_mtp_conversion = True
++                try:
++                    self.draft_model_config = ModelConfig(
++                        model=self.model,
++                        runner="draft",
++                        tokenizer=self.target_model_config.tokenizer,
++                        tokenizer_mode=self.target_model_config.tokenizer_mode,
++                        trust_remote_code=self.target_model_config.trust_remote_code,
++                        allowed_local_media_path=self.target_model_config.allowed_local_media_path,
++                        allowed_media_domains=self.target_model_config.allowed_media_domains,
++                        dtype=self.target_model_config.dtype,
++                        seed=self.target_model_config.seed,
++                        revision=self.revision,
++                        code_revision=self.code_revision,
++                        tokenizer_revision=self.target_model_config.tokenizer_revision,
++                        spec_target_max_model_len=self.target_model_config.max_model_len,
++                        quantization=self.quantization,
++                        enforce_eager=self.target_model_config.enforce_eager,
++                        max_logprobs=self.target_model_config.max_logprobs,
++                        hf_overrides=SpeculativeConfig.hf_config_override,
++                        config_format=self.target_model_config.config_format,
++                    )
++                finally:
++                    SpeculativeConfig._skip_mtp_conversion = False
+ 
+                 # Automatically detect the method
+                 if self.method in ("eagle", "eagle3"):

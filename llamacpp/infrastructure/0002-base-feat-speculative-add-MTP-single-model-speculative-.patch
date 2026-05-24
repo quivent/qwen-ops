@@ -1,0 +1,690 @@
+From 47ad7a1d68f7eb1b8bf2019b33f13a74a06e05fb Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 14:05:48 -0400
+Subject: [PATCH] feat(speculative): add MTP single-model speculative decoding
+
+Adds a new common_speculative_mtp_* helper API alongside the existing
+common_speculative_* infrastructure. Unlike the standard path which
+assumes a separate draft model, the MTP variant sources draft tokens
+from a Multi-Token Prediction head on the target context itself, via
+the llama_mtp_draft() core-library entry point (owned by the graph
+agent; forward-declared here).
+
+Mirrors the MLX reference at ~/mlx-fork/mtp_speculative_decode.py:
+draft K tokens, verify via a single K+1-token forward pass, greedy
+accept, trim KV on rejection. Stats (draft/accepted/rejected/forward
+passes/rollbacks) match the MLX script's output format.
+
+Also adds examples/mtp-speculative/ mirroring examples/speculative/
+but single-model. Reuses LLAMA_EXAMPLE_SPECULATIVE so --draft-max
+is exposed.
+
+DeltaNet recurrent-state rollback is stubbed with TODO(rollback)
+markers for the rollback agent to fill in; for attention-only
+layers the llama_memory_seq_rm-based KV trim is already correct.
+
+Build: compiles cleanly; link of llama-mtp-speculative fails on
+_llama_mtp_draft until the graph agent merges.
+---
+ common/CMakeLists.txt                        |   2 +
+ common/speculative-mtp.cpp                   | 185 ++++++++++++
+ common/speculative-mtp.h                     | 119 ++++++++
+ examples/CMakeLists.txt                      |   1 +
+ examples/mtp-speculative/CMakeLists.txt      |   5 +
+ examples/mtp-speculative/mtp-speculative.cpp | 289 +++++++++++++++++++
+ 6 files changed, 601 insertions(+)
+ create mode 100644 common/speculative-mtp.cpp
+ create mode 100644 common/speculative-mtp.h
+ create mode 100644 examples/mtp-speculative/CMakeLists.txt
+ create mode 100644 examples/mtp-speculative/mtp-speculative.cpp
+
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 27ca335be..7c00332fa 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -86,6 +86,8 @@ add_library(${TARGET} STATIC
+     sampling.h
+     speculative.cpp
+     speculative.h
++    speculative-mtp.cpp
++    speculative-mtp.h
+     unicode.cpp
+     unicode.h
+     jinja/lexer.cpp
+diff --git a/common/speculative-mtp.cpp b/common/speculative-mtp.cpp
+new file mode 100644
+index 000000000..ff24b49c7
+--- /dev/null
++++ b/common/speculative-mtp.cpp
+@@ -0,0 +1,185 @@
++#include "speculative-mtp.h"
++
++#include "common.h"
++#include "llama.h"
++#include "log.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <vector>
++
++struct common_speculative_mtp {
++    llama_context * ctx_tgt = nullptr;
++
++    // Scratch buffer reused across calls to llama_mtp_draft to avoid
++    // reallocations in the hot path.
++    std::vector<llama_token> scratch_tokens;
++
++    common_speculative_mtp_stats stats;
++};
++
++struct common_speculative_mtp * common_speculative_mtp_init(llama_context * ctx_tgt) {
++    if (ctx_tgt == nullptr) {
++        return nullptr;
++    }
++
++    auto * spec = new common_speculative_mtp;
++    spec->ctx_tgt = ctx_tgt;
++    return spec;
++}
++
++void common_speculative_mtp_free(struct common_speculative_mtp * spec) {
++    if (spec == nullptr) {
++        return;
++    }
++    delete spec;
++}
++
++llama_tokens common_speculative_mtp_draft(
++        struct common_speculative_mtp * spec,
++        llama_token                     id_last,
++        int32_t                         n_draft) {
++    llama_tokens result;
++
++    if (spec == nullptr || n_draft <= 0) {
++        return result;
++    }
++
++    if ((int32_t) spec->scratch_tokens.size() < n_draft) {
++        spec->scratch_tokens.resize(n_draft);
++    }
++
++    // Call into the core-library MTP drafting entry point. This is a
++    // cross-agent boundary: if the MTP graph agent has not yet merged,
++    // this symbol will fail to resolve at link time (but the translation
++    // unit will still compile cleanly).
++    const int32_t n = llama_mtp_draft(
++            spec->ctx_tgt,
++            id_last,
++            n_draft,
++            spec->scratch_tokens.data(),
++            /* out_logits */ nullptr);
++
++    spec->stats.draft_calls++;
++
++    if (n <= 0) {
++        return result;
++    }
++
++    result.assign(spec->scratch_tokens.begin(), spec->scratch_tokens.begin() + n);
++    return result;
++}
++
++int32_t common_speculative_mtp_verify_greedy(
++        struct common_speculative_mtp * spec,
++        const llama_tokens            & draft_tokens,
++        const float *                 (*logits_for_pos)(void * user_data, int32_t i),
++        void                          * user_data,
++        int32_t                         n_vocab) {
++    if (spec == nullptr || logits_for_pos == nullptr || n_vocab <= 0) {
++        return 0;
++    }
++
++    int32_t n_accepted = 0;
++    for (int32_t i = 0; i < (int32_t) draft_tokens.size(); ++i) {
++        const float * logits = logits_for_pos(user_data, i);
++        if (logits == nullptr) {
++            break;
++        }
++
++        // argmax over the full vocabulary — mirrors verify_draft() in
++        // mtp_speculative_decode.py. Stochastic verification can be
++        // layered on later; greedy is sufficient for v1.
++        int32_t best_id  = 0;
++        float   best_val = logits[0];
++        for (int32_t v = 1; v < n_vocab; ++v) {
++            const float l = logits[v];
++            if (l > best_val) {
++                best_val = l;
++                best_id  = v;
++            }
++        }
++
++        if (best_id == draft_tokens[i]) {
++            n_accepted++;
++        } else {
++            break;
++        }
++    }
++
++    return n_accepted;
++}
++
++void common_speculative_mtp_accept(
++        struct common_speculative_mtp * spec,
++        int32_t                         n_drafted,
++        int32_t                         n_accepted) {
++    if (spec == nullptr || n_drafted <= 0) {
++        return;
++    }
++
++    spec->stats.draft_tokens    += (size_t) n_drafted;
++    spec->stats.accepted_tokens += (size_t) n_accepted;
++    spec->stats.rejected_tokens += (size_t) (n_drafted - n_accepted);
++
++    if (n_accepted < n_drafted) {
++        // TODO(rollback): when the DeltaNet recurrent-state rollback agent
++        // lands, invoke the rollback hook here to restore the target
++        // context's recurrent state to the checkpoint captured just before
++        // the rejected draft position. For now this is a no-op: the caller
++        // is responsible for trimming the KV cache via llama_memory_seq_rm
++        // and for re-decoding the corrected token — which works correctly
++        // for attention-only layers and is the "full re-verify" fallback
++        // documented in the task brief.
++        spec->stats.rollbacks++;
++    }
++}
++
++void common_speculative_mtp_note_forward_pass(struct common_speculative_mtp * spec) {
++    if (spec == nullptr) {
++        return;
++    }
++    spec->stats.forward_passes++;
++}
++
++void common_speculative_mtp_note_committed(struct common_speculative_mtp * spec, size_t n) {
++    if (spec == nullptr) {
++        return;
++    }
++    spec->stats.total_tokens += n;
++}
++
++const common_speculative_mtp_stats & common_speculative_mtp_get_stats(const struct common_speculative_mtp * spec) {
++    static const common_speculative_mtp_stats empty;
++    if (spec == nullptr) {
++        return empty;
++    }
++    return spec->stats;
++}
++
++void common_speculative_mtp_print_stats(const struct common_speculative_mtp * spec, double elapsed_s) {
++    if (spec == nullptr) {
++        return;
++    }
++
++    const auto & s = spec->stats;
++    const double tps = elapsed_s > 0.0 ? (double) s.total_tokens / elapsed_s : 0.0;
++
++    const size_t denom = s.draft_tokens > 0 ? s.draft_tokens : 1;
++    const double acc_pct = 100.0 * (double) s.accepted_tokens / (double) denom;
++    const double rej_pct = 100.0 * (double) s.rejected_tokens / (double) denom;
++
++    LOG_INF("\n");
++    LOG_INF("============================================================\n");
++    LOG_INF("MTP speculative decoding stats:\n");
++    LOG_INF("  Tokens generated:    %zu\n", s.total_tokens);
++    LOG_INF("  Wall time:           %.2fs\n", elapsed_s);
++    LOG_INF("  Throughput:          %.1f tok/s\n", tps);
++    LOG_INF("  Forward passes:      %zu\n", s.forward_passes);
++    LOG_INF("  Draft calls:         %zu\n", s.draft_calls);
++    LOG_INF("  Draft tokens:        %zu\n", s.draft_tokens);
++    LOG_INF("  Accepted:            %zu (%.0f%%)\n", s.accepted_tokens, acc_pct);
++    LOG_INF("  Rejected:            %zu (%.0f%%)\n", s.rejected_tokens, rej_pct);
++    LOG_INF("  Rollbacks:           %zu\n", s.rollbacks);
++    LOG_INF("============================================================\n");
++}
+diff --git a/common/speculative-mtp.h b/common/speculative-mtp.h
+new file mode 100644
+index 000000000..06780be93
+--- /dev/null
++++ b/common/speculative-mtp.h
+@@ -0,0 +1,119 @@
++#pragma once
++
++// MTP (Multi-Token Prediction) speculative decoding helpers.
++//
++// Unlike the standard common_speculative_* API in speculative.h, which
++// assumes a separate draft model, these helpers source draft tokens from
++// an MTP head on the target model itself. The target context therefore
++// plays both the drafting and verification roles.
++//
++// The drafting side relies on a C API that is being added to the core
++// llama library by a separate agent. We forward-declare it here so this
++// file can compile independently; the symbol will be resolved at link
++// time once the MTP graph agent merges:
++//
++//     int32_t llama_mtp_draft(
++//         struct llama_context * ctx,
++//         llama_token            last_token,
++//         int32_t                n_draft,
++//         llama_token          * out_tokens,
++//         float                * out_logits);   // optional, may be NULL
++//
++// Contract (as agreed with the MTP graph agent):
++//   * `ctx`        - target context whose last decoded token is `last_token`.
++//                    The KV cache state is NOT mutated by this call.
++//   * `last_token` - the most recently verified / committed token id.
++//   * `n_draft`    - maximum number of additional tokens to draft from
++//                    the MTP heads (K in the MLX reference).
++//   * `out_tokens` - caller-provided buffer of at least `n_draft` slots.
++//                    On return, holds the drafted token ids (argmax of
++//                    each MTP head) in order.
++//   * `out_logits` - optional. If non-NULL, a flat buffer of at least
++//                    `n_draft * n_vocab` floats receiving the per-head
++//                    logits for downstream stochastic verification.
++//   * returns      - number of drafted tokens actually written (0 .. n_draft).
++//                    A return value of 0 means the target model exposes no
++//                    MTP heads and the caller should fall back to plain
++//                    autoregressive decoding.
++
++#include "llama.h"
++#include "common.h"
++
++#include <cstdint>
++#include <vector>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Forward declaration of the core-library MTP drafting entry point.
++// The definition is provided by the MTP graph agent; until that lands
++// this symbol will be unresolved at link time (compile-only usage here).
++int32_t llama_mtp_draft(
++        struct llama_context * ctx,
++        llama_token            last_token,
++        int32_t                n_draft,
++        llama_token          * out_tokens,
++        float                * out_logits);
++
++#ifdef __cplusplus
++}
++#endif
++
++struct common_speculative_mtp;
++
++// Aggregate statistics that mirror the MLX reference's stats dict.
++struct common_speculative_mtp_stats {
++    size_t total_tokens    = 0; // tokens ultimately committed to the output
++    size_t draft_tokens    = 0; // tokens proposed by the MTP head
++    size_t accepted_tokens = 0; // draft tokens accepted during verification
++    size_t rejected_tokens = 0; // draft tokens rejected during verification
++    size_t forward_passes  = 0; // target-model forward passes
++    size_t rollbacks       = 0; // recurrent-state rollbacks performed
++    size_t draft_calls     = 0; // number of llama_mtp_draft invocations
++};
++
++// Construct / destroy an MTP speculative helper bound to a target context.
++struct common_speculative_mtp * common_speculative_mtp_init(llama_context * ctx_tgt);
++void                            common_speculative_mtp_free(struct common_speculative_mtp * spec);
++
++// Draft up to `n_draft` tokens from the target model's MTP head, given
++// the id of the most recently verified token. Returns the draft tokens
++// in order. An empty result means the target has no MTP heads and the
++// caller should fall back to standard single-token decoding.
++llama_tokens common_speculative_mtp_draft(
++        struct common_speculative_mtp * spec,
++        llama_token                     id_last,
++        int32_t                         n_draft);
++
++// Greedy verification: compare draft tokens against argmax of the
++// corresponding target logits. Returns the number of accepted tokens.
++// `logits_for_pos(i)` must return a pointer to the target-model logits
++// that predict the token immediately AFTER draft position i-1 (i.e. the
++// logits output by the batch slot corresponding to the i-th draft input).
++int32_t common_speculative_mtp_verify_greedy(
++        struct common_speculative_mtp * spec,
++        const llama_tokens            & draft_tokens,
++        const float *                 (*logits_for_pos)(void * user_data, int32_t i),
++        void                          * user_data,
++        int32_t                         n_vocab);
++
++// Inform the helper of how many draft tokens were accepted in the last
++// verification pass. Updates stats and invokes the recurrent-state
++// rollback hook for the rejected suffix.
++void common_speculative_mtp_accept(
++        struct common_speculative_mtp * spec,
++        int32_t                         n_drafted,
++        int32_t                         n_accepted);
++
++// Record a target forward pass.
++void common_speculative_mtp_note_forward_pass(struct common_speculative_mtp * spec);
++
++// Bump the "total tokens committed" counter.
++void common_speculative_mtp_note_committed(struct common_speculative_mtp * spec, size_t n);
++
++// Accessors.
++const common_speculative_mtp_stats & common_speculative_mtp_get_stats(const struct common_speculative_mtp * spec);
++
++// Print a stats summary that mirrors the MLX reference's output format.
++void common_speculative_mtp_print_stats(const struct common_speculative_mtp * spec, double elapsed_s);
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index a29dc707c..6ecdf23ec 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -32,6 +32,7 @@ else()
+     add_subdirectory(simple-chat)
+     add_subdirectory(speculative)
+     add_subdirectory(speculative-simple)
++    add_subdirectory(mtp-speculative)
+     add_subdirectory(gen-docs)
+     add_subdirectory(training)
+     add_subdirectory(diffusion)
+diff --git a/examples/mtp-speculative/CMakeLists.txt b/examples/mtp-speculative/CMakeLists.txt
+new file mode 100644
+index 000000000..2336428d1
+--- /dev/null
++++ b/examples/mtp-speculative/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-mtp-speculative)
++add_executable(${TARGET} mtp-speculative.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+new file mode 100644
+index 000000000..b42fd537a
+--- /dev/null
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -0,0 +1,289 @@
++// MTP (Multi-Token Prediction) speculative decoding example.
++//
++// Single-model speculative decoding: draft tokens come from the target
++// model's MTP heads rather than a separate draft model. Mirrors the
++// MLX reference at ~/mlx-fork/mtp_speculative_decode.py.
++//
++// CLI:
++//   llama-mtp-speculative -m <model.gguf> -p <prompt> -n <tokens> --draft-max <K>
++
++#include "arg.h"
++#include "common.h"
++#include "log.h"
++#include "llama.h"
++#include "sampling.h"
++#include "speculative-mtp.h"
++
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++// Helper: pull logits for draft position i from a just-decoded verify batch.
++struct verify_logits_ctx {
++    llama_context * ctx_tgt  = nullptr;
++    int32_t         i_base   = 0; // index in the batch of the first "draft-following" slot
++};
++
++static const float * verify_logits_for_pos(void * user_data, int32_t i) {
++    auto * v = (verify_logits_ctx *) user_data;
++    return llama_get_logits_ith(v->ctx_tgt, v->i_base + i);
++}
++
++int main(int argc, char ** argv) {
++    common_params params;
++
++    // Reuse LLAMA_EXAMPLE_SPECULATIVE so --draft-max / --draft-n populates
++    // params.speculative.n_max automatically.
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SPECULATIVE)) {
++        return 1;
++    }
++
++    if (params.n_predict < -1) {
++        LOG_ERR("%s: --n-predict must be >= -1\n", __func__);
++        return 1;
++    }
++
++    common_init();
++
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    // Load the target model ONLY — no separate draft model.
++    auto llama_init_tgt = common_init_from_params(params);
++
++    llama_model   * model_tgt = llama_init_tgt->model();
++    llama_context * ctx_tgt   = llama_init_tgt->context();
++
++    if (model_tgt == nullptr || ctx_tgt == nullptr) {
++        LOG_ERR("%s: failed to load target model\n", __func__);
++        return 1;
++    }
++
++    const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
++    const int32_t       n_vocab   = llama_vocab_n_tokens(vocab_tgt);
++
++    auto * mem_tgt = llama_get_memory(ctx_tgt);
++
++    // Tokenize the prompt.
++    std::vector<llama_token> inp = common_tokenize(ctx_tgt, params.prompt, true, true);
++
++    const int max_context_size     = llama_n_ctx(ctx_tgt);
++    const int max_tokens_list_size = max_context_size - 4;
++    if ((int) inp.size() > max_tokens_list_size) {
++        LOG_ERR("%s: prompt too long (%d tokens, max %d)\n", __func__, (int) inp.size(), max_tokens_list_size);
++        return 1;
++    }
++
++    LOG("\n");
++    for (auto id : inp) {
++        LOG("%s", common_token_to_piece(ctx_tgt, id).c_str());
++    }
++
++    const int n_input      = (int) inp.size();
++    const int n_draft_max  = params.speculative.n_max > 0 ? params.speculative.n_max : 3;
++    const int n_predict    = params.n_predict > 0 ? params.n_predict : 128;
++
++    // --- Prefill ---
++    // Decode all but the last prompt token, then the last token alone so
++    // the final slot's logits are materialized for initial sampling.
++    if (llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), n_input - 1)) != 0) {
++        LOG_ERR("%s: prefill (bulk) failed\n", __func__);
++        return 1;
++    }
++    if (llama_decode(ctx_tgt, llama_batch_get_one(&inp.back(), 1)) != 0) {
++        LOG_ERR("%s: prefill (tail) failed\n", __func__);
++        return 1;
++    }
++
++    // Greedy-sample the first generated token from the prefill logits.
++    auto argmax_logits = [n_vocab](const float * logits) -> llama_token {
++        llama_token best_id = 0;
++        float       best_v  = logits[0];
++        for (int32_t v = 1; v < n_vocab; ++v) {
++            if (logits[v] > best_v) {
++                best_v  = logits[v];
++                best_id = v;
++            }
++        }
++        return best_id;
++    };
++
++    llama_token id_last = argmax_logits(llama_get_logits_ith(ctx_tgt, 0));
++
++    std::vector<llama_token> generated;
++    generated.reserve(n_predict);
++    generated.push_back(id_last);
++
++    // Track the current KV cache length for seq 0 so we can trim on reject.
++    int32_t n_past = n_input; // after prefill, position n_input - 1 is last decoded
++
++    // Create the MTP speculative helper and a persistent verification batch.
++    common_speculative_mtp * spec = common_speculative_mtp_init(ctx_tgt);
++    if (spec == nullptr) {
++        LOG_ERR("%s: failed to init MTP speculative helper\n", __func__);
++        return 1;
++    }
++
++    common_speculative_mtp_note_forward_pass(spec); // count the two prefill decodes
++    common_speculative_mtp_note_forward_pass(spec);
++    common_speculative_mtp_note_committed(spec, 1);
++
++    LOG("%s", common_token_to_piece(ctx_tgt, id_last).c_str());
++
++    // Allocate a reusable batch large enough for 1 + K verification tokens.
++    llama_batch verify_batch = llama_batch_init(1 + n_draft_max, 0, 1);
++
++    const llama_token eos_tok = llama_vocab_eos(vocab_tgt);
++
++    const int64_t t_dec_start = ggml_time_us();
++
++    while ((int) generated.size() < n_predict) {
++        // Step 1: draft K tokens from the MTP head on the target.
++        llama_tokens drafts = common_speculative_mtp_draft(spec, id_last, n_draft_max);
++
++        if (drafts.empty()) {
++            // No MTP heads available (or draft head returned nothing).
++            // Fall back to plain autoregressive greedy.
++            verify_batch.n_tokens   = 1;
++            verify_batch.token[0]   = id_last;
++            verify_batch.pos[0]     = n_past;
++            verify_batch.n_seq_id[0]= 1;
++            verify_batch.seq_id[0][0] = 0;
++            verify_batch.logits[0]  = 1;
++
++            if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                LOG_ERR("%s: autoregressive fallback decode failed\n", __func__);
++                break;
++            }
++            common_speculative_mtp_note_forward_pass(spec);
++            n_past += 1;
++
++            const llama_token nt = argmax_logits(llama_get_logits_ith(ctx_tgt, 0));
++            generated.push_back(nt);
++            common_speculative_mtp_note_committed(spec, 1);
++            LOG("%s", common_token_to_piece(ctx_tgt, nt).c_str());
++
++            id_last = nt;
++            if (nt == eos_tok) break;
++            continue;
++        }
++
++        const int32_t n_drafted = (int32_t) drafts.size();
++
++        // Step 2: build verification batch = [id_last, draft_0, .., draft_{K-1}]
++        verify_batch.n_tokens = 1 + n_drafted;
++        verify_batch.token[0]     = id_last;
++        verify_batch.pos[0]       = n_past;
++        verify_batch.n_seq_id[0]  = 1;
++        verify_batch.seq_id[0][0] = 0;
++        verify_batch.logits[0]    = 1;
++        for (int32_t i = 0; i < n_drafted; ++i) {
++            verify_batch.token[1 + i]     = drafts[i];
++            verify_batch.pos[1 + i]       = n_past + 1 + i;
++            verify_batch.n_seq_id[1 + i]  = 1;
++            verify_batch.seq_id[1 + i][0] = 0;
++            verify_batch.logits[1 + i]    = 1;
++        }
++
++        // Step 3: forward pass on all K+1 tokens.
++        if (llama_decode(ctx_tgt, verify_batch) != 0) {
++            LOG_ERR("%s: verification decode failed\n", __func__);
++            break;
++        }
++        common_speculative_mtp_note_forward_pass(spec);
++
++        // Step 4: greedy verification.
++        //
++        // Batch slot i (i in [0..n_drafted]) holds logits predicting the
++        // token AFTER position n_past + i. We compare drafts[i] against
++        // argmax(logits at slot i). Slot n_drafted's logits give the next
++        // token when all drafts are accepted.
++        verify_logits_ctx vctx{ctx_tgt, /*i_base=*/0};
++        const int32_t n_accepted = common_speculative_mtp_verify_greedy(
++                spec, drafts, verify_logits_for_pos, &vctx, n_vocab);
++
++        common_speculative_mtp_accept(spec, n_drafted, n_accepted);
++
++        // Step 5: commit accepted draft tokens.
++        for (int32_t i = 0; i < n_accepted; ++i) {
++            generated.push_back(drafts[i]);
++            LOG("%s", common_token_to_piece(ctx_tgt, drafts[i]).c_str());
++        }
++        common_speculative_mtp_note_committed(spec, (size_t) n_accepted);
++
++        // Step 6: handle rejection / next token selection.
++        if (n_accepted < n_drafted) {
++            // Correction token: argmax of the logits at the rejected slot.
++            const float * rej_logits = llama_get_logits_ith(ctx_tgt, n_accepted);
++            const llama_token corr = argmax_logits(rej_logits);
++
++            generated.push_back(corr);
++            common_speculative_mtp_note_committed(spec, 1);
++            LOG("%s", common_token_to_piece(ctx_tgt, corr).c_str());
++
++            // Trim the KV cache for the rejected suffix.
++            //
++            // Positions in the cache after the accepted-prefix end:
++            //   kept: [0 .. n_past + n_accepted]  (id_last + n_accepted drafts)
++            //   drop: (n_past + n_accepted .. n_past + n_drafted]
++            //
++            // TODO(rollback): once the DeltaNet recurrent-state rollback
++            // agent lands, invoke the rollback hook here BEFORE trimming
++            // so DeltaNet layers' recurrent state is restored to the
++            // checkpoint captured at position (n_past + n_accepted).
++            // Until then, for attention-only layers this KV trim is the
++            // full-re-verify fallback and is correct by itself.
++            const llama_pos keep_end = n_past + 1 + n_accepted;
++            llama_memory_seq_rm(mem_tgt, 0, keep_end, -1);
++
++            // We then need the correction token's own KV entry in the cache
++            // so its recurrent/attention state is committed for the next
++            // iteration. Do a single-token decode at position keep_end.
++            verify_batch.n_tokens     = 1;
++            verify_batch.token[0]     = corr;
++            verify_batch.pos[0]       = keep_end;
++            verify_batch.n_seq_id[0]  = 1;
++            verify_batch.seq_id[0][0] = 0;
++            verify_batch.logits[0]    = 1;
++            if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                LOG_ERR("%s: correction decode failed\n", __func__);
++                break;
++            }
++            common_speculative_mtp_note_forward_pass(spec);
++
++            n_past  = keep_end + 1;
++            id_last = corr;
++        } else {
++            // All drafts accepted: the logits at the final slot give the
++            // next token. Note: that next token's KV entry is NOT yet in
++            // the cache; it will be added as the FIRST token of the next
++            // verification batch.
++            const float * tail_logits = llama_get_logits_ith(ctx_tgt, n_drafted);
++            const llama_token nt = argmax_logits(tail_logits);
++            generated.push_back(nt);
++            common_speculative_mtp_note_committed(spec, 1);
++            LOG("%s", common_token_to_piece(ctx_tgt, nt).c_str());
++
++            n_past += 1 + n_drafted; // id_last + accepted drafts committed to cache
++            id_last = nt;
++        }
++
++        if (id_last == eos_tok) {
++            break;
++        }
++    }
++
++    const int64_t t_dec_end = ggml_time_us();
++    const double elapsed_s  = (t_dec_end - t_dec_start) / 1e6;
++
++    LOG("\n\n");
++    common_speculative_mtp_print_stats(spec, elapsed_s);
++
++    llama_batch_free(verify_batch);
++    common_speculative_mtp_free(spec);
++
++    llama_backend_free();
++
++    return 0;
++}
+-- 
+2.51.2
+

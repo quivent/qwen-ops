@@ -1,0 +1,30 @@
+--- vllm/model_executor/layers/vocab_parallel_embedding.py
++++ Add quantize_to_int8() method and INT8 forward path to VocabParallelEmbedding
+
++    def quantize_to_int8(self):
++        """Quantize embedding to INT8 on GPU. Saves ~1.27 GiB VRAM."""
++        if hasattr(self, 'weight') and self.weight.dtype != torch.int8:
++            dev = self.weight.device
++            w = self.weight.data.cpu().float()
++            scale = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 127.0
++            w_int8 = (w / scale).round().clamp(-127, 127).to(torch.int8)
++            scale_f16 = scale.to(torch.float16)
++            del self.weight
++            torch.cuda.empty_cache()
++            self.weight = torch.nn.Parameter(w_int8.to(dev), requires_grad=False)
++            self._int8_scale = torch.nn.Parameter(scale_f16.to(dev), requires_grad=False)
++            self._embed_int8 = True
+
+     In forward_native, before the standard embedding call:
++        if getattr(self, '_embed_int8', False):
++            idx = masked_input.long()
++            raw = torch.nn.functional.embedding(idx, self.weight.data)
++            scale = torch.nn.functional.embedding(idx, self._int8_scale)
++            output_parallel = raw.to(torch.float16) * scale
++        else:
+             output_parallel = self.quant_method.embedding(self, masked_input.long())
+
+--- vllm/model_executor/models/qwen3_5.py
++++ In Qwen3_5ForCausalLMBase.load_weights, after loader.load_weights(weights):
++        if hasattr(self.model, 'embed_tokens'):
++            self.model.embed_tokens.quantize_to_int8()

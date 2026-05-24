@@ -1,0 +1,423 @@
+From 85f456fdfe8b53dfafdc78dd25583b2da34b4ea0 Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 14:05:46 -0400
+Subject: [PATCH] feat(memory): recurrent-state snapshot/restore for DeltaNet
+ rollback
+
+Add a snapshot/restore API for the llama_memory_recurrent conv_state and
+rnn_state tensors used by Qwen3-Next and other hybrid DeltaNet models.
+Speculative decoding can now capture the recurrent state before drafting,
+and cheaply restore it on rejection without re-running a full forward pass.
+
+The snapshot copies only the small per-layer recurrent tensors (KB/layer)
+plus cell metadata; KV-cache rollback for attention layers in hybrid
+models is handled separately via the existing llama_memory_seq_rm path.
+
+Public API in include/llama.h:
+  llama_memory_snapshot_recurrent(ctx, out_handle)
+  llama_memory_restore_recurrent(ctx, handle)
+  llama_memory_release_snapshot(handle)
+  llama_memory_snapshot_size(handle)
+
+A TODO(split-rec) marker is left in src/models/qwen3next.cpp describing
+the follow-up work to split the GDN recurrence into T=1 steps while
+keeping the surrounding matmuls batched at T=N, mirroring the MLX
+reference in delta_net_rollback.py.
+---
+ include/llama.h               |  48 ++++++++++++++
+ src/CMakeLists.txt            |   1 +
+ src/llama-context.cpp         |  78 ++++++++++++++++++++++
+ src/llama-memory-snapshot.cpp | 121 ++++++++++++++++++++++++++++++++++
+ src/llama-memory-snapshot.h   |  65 ++++++++++++++++++
+ src/models/qwen3next.cpp      |   8 +++
+ 6 files changed, 321 insertions(+)
+ create mode 100644 src/llama-memory-snapshot.cpp
+ create mode 100644 src/llama-memory-snapshot.h
+
+diff --git a/include/llama.h b/include/llama.h
+index abcd6bd04..f0bc95cff 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -807,6 +807,54 @@ extern "C" {
+             ggml_backend_sched_eval_callback callback,
+             void * user_data);
+ 
++    //
++    // Recurrent-state rollback (split-recurrence speculative decoding)
++    //
++    // Opaque handle representing a captured snapshot of the DeltaNet / SSM
++    // recurrent state (conv_state + rnn_state per layer). Intended for hybrid
++    // models such as Qwen3-Next where the recurrent state cannot be trimmed
++    // like a KV cache, so speculative decoding needs a cheap rollback path.
++    //
++    // Typical usage:
++    //     llama_memory_recurrent_snapshot_t snap = NULL;
++    //     llama_memory_snapshot_recurrent(ctx, &snap);
++    //     // ... run speculative decode ...
++    //     if (rejected) {
++    //         llama_memory_restore_recurrent(ctx, snap);
++    //         llama_memory_seq_rm(mem, seq_id, accepted_pos, -1);
++    //     }
++    //     llama_memory_release_snapshot(snap);
++    //
++    // Only the (small) recurrent state is copied. KV-cache rollback for
++    // attention layers in hybrid models is handled separately via the
++    // existing llama_memory_seq_rm() API.
++
++    typedef struct llama_memory_recurrent_snapshot * llama_memory_recurrent_snapshot_t;
++
++    // Capture the current recurrent state into a newly allocated snapshot.
++    // Returns 0 on success, negative on failure. On success, *out_handle
++    // points to a snapshot that must be freed with llama_memory_release_snapshot().
++    LLAMA_API int32_t llama_memory_snapshot_recurrent(
++            struct llama_context * ctx,
++            llama_memory_recurrent_snapshot_t * out_handle);
++
++    // Restore the recurrent state from a previously captured snapshot.
++    // Returns 0 on success, negative on failure (e.g. shape mismatch).
++    // Does NOT touch the KV cache — caller must use llama_memory_seq_rm()
++    // to rewind attention state for the same sequence/position range.
++    LLAMA_API int32_t llama_memory_restore_recurrent(
++            struct llama_context * ctx,
++            llama_memory_recurrent_snapshot_t handle);
++
++    // Free a snapshot returned by llama_memory_snapshot_recurrent().
++    // Safe to call with NULL.
++    LLAMA_API void llama_memory_release_snapshot(
++            llama_memory_recurrent_snapshot_t handle);
++
++    // Return the number of bytes held by a snapshot (diagnostic).
++    LLAMA_API size_t llama_memory_snapshot_size(
++            llama_memory_recurrent_snapshot_t handle);
++
+     //
+     // State / sessions
+     //
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 2a661a1fe..08f0ddbb8 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -26,6 +26,7 @@ add_library(llama
+             llama-memory-hybrid.cpp
+             llama-memory-hybrid-iswa.cpp
+             llama-memory-recurrent.cpp
++            llama-memory-snapshot.cpp
+             llama-mmap.cpp
+             llama-model-loader.cpp
+             llama-model-saver.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b741a7e05..d1a418ffa 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -6,6 +6,9 @@
+ #include "llama-io.h"
+ #include "llama-kv-cache.h"  // Socratic Tuner: KV cache extraction
+ #include "llama-memory.h"
++#include "llama-memory-hybrid.h"
++#include "llama-memory-recurrent.h"
++#include "llama-memory-snapshot.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ 
+@@ -3176,6 +3179,81 @@ bool llama_memory_can_shift(llama_memory_t mem) {
+     return mem->get_can_shift();
+ }
+ 
++//
++// recurrent-state snapshot / restore (split-recurrence rollback)
++//
++
++static llama_memory_recurrent * llama_memory_get_recurrent(llama_memory_t mem) {
++    if (mem == nullptr) {
++        return nullptr;
++    }
++
++    if (auto * rec = dynamic_cast<llama_memory_recurrent *>(mem)) {
++        return rec;
++    }
++
++    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
++        return hyb->get_mem_recr();
++    }
++
++    return nullptr;
++}
++
++int32_t llama_memory_snapshot_recurrent(
++        struct llama_context * ctx,
++        llama_memory_recurrent_snapshot_t * out_handle) {
++    if (ctx == nullptr || out_handle == nullptr) {
++        return -1;
++    }
++
++    *out_handle = nullptr;
++
++    llama_memory_recurrent * rec = llama_memory_get_recurrent(ctx->get_memory());
++    if (rec == nullptr) {
++        // no recurrent state to snapshot (e.g. pure attention model)
++        return -2;
++    }
++
++    auto * snap = new llama_memory_recurrent_snapshot();
++    if (!llama_memory_recurrent_snapshot_capture(rec, *snap)) {
++        delete snap;
++        return -3;
++    }
++
++    *out_handle = snap;
++    return 0;
++}
++
++int32_t llama_memory_restore_recurrent(
++        struct llama_context * ctx,
++        llama_memory_recurrent_snapshot_t handle) {
++    if (ctx == nullptr || handle == nullptr) {
++        return -1;
++    }
++
++    llama_memory_recurrent * rec = llama_memory_get_recurrent(ctx->get_memory());
++    if (rec == nullptr) {
++        return -2;
++    }
++
++    if (!llama_memory_recurrent_snapshot_restore(rec, *handle)) {
++        return -3;
++    }
++
++    return 0;
++}
++
++void llama_memory_release_snapshot(llama_memory_recurrent_snapshot_t handle) {
++    delete handle;
++}
++
++size_t llama_memory_snapshot_size(llama_memory_recurrent_snapshot_t handle) {
++    if (handle == nullptr) {
++        return 0;
++    }
++    return handle->bytes;
++}
++
+ // Socratic Tuner: set/swap eval callback per-request
+ void llama_set_eval_callback(
+         struct llama_context * ctx,
+diff --git a/src/llama-memory-snapshot.cpp b/src/llama-memory-snapshot.cpp
+new file mode 100644
+index 000000000..b100ce401
+--- /dev/null
++++ b/src/llama-memory-snapshot.cpp
+@@ -0,0 +1,121 @@
++#include "llama-memory-snapshot.h"
++
++#include "llama-memory-recurrent.h"
++
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <cstring>
++
++bool llama_memory_recurrent_snapshot_capture(
++        const llama_memory_recurrent * mem_recr,
++        llama_memory_recurrent_snapshot & out) {
++    if (mem_recr == nullptr) {
++        return false;
++    }
++
++    const size_t n_layer = mem_recr->r_l.size();
++
++    out.r_data.assign(n_layer, {});
++    out.s_data.assign(n_layer, {});
++    out.bytes = 0;
++
++    for (size_t il = 0; il < n_layer; ++il) {
++        ggml_tensor * r = mem_recr->r_l[il];
++        if (r != nullptr) {
++            const size_t nb = ggml_nbytes(r);
++            out.r_data[il].resize(nb);
++            ggml_backend_tensor_get(r, out.r_data[il].data(), 0, nb);
++            out.bytes += nb;
++        }
++    }
++
++    for (size_t il = 0; il < mem_recr->s_l.size(); ++il) {
++        ggml_tensor * s = mem_recr->s_l[il];
++        if (s != nullptr) {
++            const size_t nb = ggml_nbytes(s);
++            out.s_data[il].resize(nb);
++            ggml_backend_tensor_get(s, out.s_data[il].data(), 0, nb);
++            out.bytes += nb;
++        }
++    }
++
++    out.cells.clear();
++    out.cells.reserve(mem_recr->cells.size());
++    for (const auto & c : mem_recr->cells) {
++        llama_memory_recurrent_snapshot::cell_meta m;
++        m.pos  = c.pos;
++        m.src  = c.src;
++        m.src0 = c.src0;
++        m.tail = c.tail;
++        for (const auto & id : c.seq_id) {
++            m.seq_id.insert((int32_t) id);
++        }
++        out.cells.push_back(std::move(m));
++    }
++
++    out.head = mem_recr->head;
++    out.used = mem_recr->used;
++    out.n    = mem_recr->n;
++    out.rs_z = mem_recr->rs_z;
++
++    return true;
++}
++
++bool llama_memory_recurrent_snapshot_restore(
++        llama_memory_recurrent * mem_recr,
++        const llama_memory_recurrent_snapshot & snap) {
++    if (mem_recr == nullptr) {
++        return false;
++    }
++
++    if (snap.r_data.size() != mem_recr->r_l.size() ||
++        snap.s_data.size() != mem_recr->s_l.size() ||
++        snap.cells.size()  != mem_recr->cells.size()) {
++        return false;
++    }
++
++    for (size_t il = 0; il < mem_recr->r_l.size(); ++il) {
++        ggml_tensor * r = mem_recr->r_l[il];
++        if (r == nullptr) {
++            continue;
++        }
++        const size_t nb = ggml_nbytes(r);
++        if (snap.r_data[il].size() != nb) {
++            return false;
++        }
++        ggml_backend_tensor_set(r, snap.r_data[il].data(), 0, nb);
++    }
++
++    for (size_t il = 0; il < mem_recr->s_l.size(); ++il) {
++        ggml_tensor * s = mem_recr->s_l[il];
++        if (s == nullptr) {
++            continue;
++        }
++        const size_t nb = ggml_nbytes(s);
++        if (snap.s_data[il].size() != nb) {
++            return false;
++        }
++        ggml_backend_tensor_set(s, snap.s_data[il].data(), 0, nb);
++    }
++
++    for (size_t i = 0; i < snap.cells.size(); ++i) {
++        auto & dst = mem_recr->cells[i];
++        const auto & src = snap.cells[i];
++        dst.pos  = src.pos;
++        dst.src  = src.src;
++        dst.src0 = src.src0;
++        dst.tail = src.tail;
++        dst.seq_id.clear();
++        for (const auto & id : src.seq_id) {
++            dst.seq_id.insert((llama_seq_id) id);
++        }
++    }
++
++    mem_recr->head = snap.head;
++    mem_recr->used = snap.used;
++    mem_recr->n    = snap.n;
++    mem_recr->rs_z = snap.rs_z;
++
++    return true;
++}
+diff --git a/src/llama-memory-snapshot.h b/src/llama-memory-snapshot.h
+new file mode 100644
+index 000000000..602c34e78
+--- /dev/null
++++ b/src/llama-memory-snapshot.h
+@@ -0,0 +1,65 @@
++#pragma once
++
++#include "llama.h"
++
++#include <cstdint>
++#include <vector>
++#include <set>
++
++//
++// DeltaNet / recurrent-state snapshot (split-recurrence rollback support)
++//
++// Captures the small conv_state + rnn_state tensors held by a
++// llama_memory_recurrent (directly or via a llama_memory_hybrid wrapper) so
++// that speculative decoding can reject drafted tokens without re-running a
++// full forward pass.
++//
++// KV-cache rollback (for attention layers in hybrid models) is NOT performed
++// here. Callers handle that via the existing llama_memory_seq_rm path, which
++// is already cheap.
++//
++// Reference: ~/mlx-fork/delta_net_rollback.py (immutable MLX arrays give
++// zero-copy rollback). In ggml the tensors are mutable, so we copy — but the
++// recurrent state is small (order of a few MiB total) compared to a full
++// forward pass, so snapshot cost is still negligible.
++//
++
++class llama_memory_recurrent;
++
++struct llama_memory_recurrent_snapshot {
++    // per-layer data blobs, indexed by layer. Empty entries correspond to
++    // null r_l/s_l pointers (non-recurrent layers in a hybrid model).
++    std::vector<std::vector<uint8_t>> r_data;
++    std::vector<std::vector<uint8_t>> s_data;
++
++    // cell metadata needed to restore head/tail book-keeping
++    struct cell_meta {
++        int32_t pos;
++        int32_t src;
++        int32_t src0;
++        int32_t tail;
++        std::set<int32_t> seq_id;
++    };
++
++    std::vector<cell_meta> cells;
++    uint32_t head = 0;
++    uint32_t used = 0;
++    uint32_t n    = 0;
++    int32_t  rs_z = -1;
++
++    // total bytes copied (diagnostic)
++    size_t bytes = 0;
++};
++
++// Capture the current recurrent state from `mem_recr` into `out`.
++// Returns false if `mem_recr` is null.
++bool llama_memory_recurrent_snapshot_capture(
++        const llama_memory_recurrent * mem_recr,
++        llama_memory_recurrent_snapshot & out);
++
++// Restore a previously captured snapshot into `mem_recr`.
++// Returns false if shapes do not match (e.g. snapshot was taken against a
++// different model / cache size).
++bool llama_memory_recurrent_snapshot_restore(
++        llama_memory_recurrent * mem_recr,
++        const llama_memory_recurrent_snapshot & snap);
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index 974120ea6..79790b89d 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -431,6 +431,14 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
+     cb(v_conv, "v_conv_predelta", il);
+ 
+     // Choose between build_delta_net_chunking, build_delta_net_recurrent, and build_delta_net_autoregressive based on n_tokens
++    // TODO(split-rec): for speculative decoding with a small draft length (T=N), ideally the
++    // in_proj / out_proj matmuls should stay batched at T=N while the GDN recurrence is split
++    // into T=1 steps that capture intermediate (conv_state, rnn_state) snapshots after each token,
++    // mirroring the MLX reference in ~/mlx-fork/delta_net_rollback.py. ggml currently lacks a
++    // graph primitive for "run this sub-graph N times, capture state after each step", so v1
++    // uses a coarse snapshot/restore at token boundaries via llama_memory_snapshot_recurrent().
++    // Follow-up: expose a split-recurrence graph-build path that writes conv_states_all / ssm_states_all
++    // N times in one graph and returns handles to each intermediate state view.
+     std::pair<ggml_tensor *, ggml_tensor *> attn_out; // pair of (output, new_state)
+     if (n_seq_tokens == 1) {
+         attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, il);
+-- 
+2.51.2
+

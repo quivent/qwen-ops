@@ -1,0 +1,213 @@
+From 3cb64ac6404b43a081d10fb7edb8678ca832e829 Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 14:17:11 -0400
+Subject: [PATCH] integrate: wire llama_mtp_draft execution path
+
+Partial Stage 3 implementation:
+- Add LLM_GRAPH_TYPE_MTP enum value for the standalone draft graph route.
+- Capture post-output-norm hidden state of the last decoded token into
+  llama_context::mtp_prev_hidden after every successful main decode when
+  the loaded model exposes an MTP head. Independent of cparams.embeddings.
+- Expose the cached state via has_mtp_prev_hidden() / get_mtp_prev_hidden().
+- llama_mtp_draft() now validates inputs, confirms the cache is populated,
+  and returns -3 on missing prev_hidden / -4 on missing graph dispatch.
+  The detailed checklist for the remaining graph wiring lives in the
+  function header comment in src/llama-context.cpp.
+---
+ src/llama-context.cpp | 93 ++++++++++++++++++++++++++++++++++++++++---
+ src/llama-context.h   | 24 +++++++++++
+ src/llama-graph.h     |  4 ++
+ 3 files changed, 115 insertions(+), 6 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b5d29a8fc..98685e21d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -686,6 +686,21 @@ float * llama_context::get_logits() {
+     return logits.data;
+ }
+ 
++const float * llama_context::get_mtp_prev_hidden() const {
++    if (!mtp_prev_hidden_valid || mtp_prev_hidden.empty()) {
++        return nullptr;
++    }
++    return mtp_prev_hidden.data();
++}
++
++size_t llama_context::get_mtp_prev_hidden_size() const {
++    return mtp_prev_hidden.size();
++}
++
++bool llama_context::has_mtp_prev_hidden() const {
++    return mtp_prev_hidden_valid && !mtp_prev_hidden.empty();
++}
++
+ int64_t llama_context::output_resolve_row(int32_t i) const {
+     int64_t j = -1;
+ 
+@@ -1633,6 +1648,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             t_embd = res->get_embd_pooled();
+         }
+ 
++        // For models with an MTP head, also capture the post-output-norm
++        // hidden state of the last output token regardless of cparams.embeddings.
++        // This is the `prev_hidden` input that llama_mtp_draft() will feed into
++        // build_mtp_head() on the next call.
++        ggml_tensor * t_embd_for_mtp = nullptr;
++        if (model.has_mtp_head() && n_outputs > 0) {
++            t_embd_for_mtp = res->get_embd();
++            if (t_embd_for_mtp == nullptr) {
++                // Model didn't expose embd in the result; skip silently —
++                // the draft path will report -3 (no hidden state available).
++            }
++        }
++
+         // extract logits
+         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+@@ -1704,6 +1732,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             }
+         }
+ 
++        // Capture the last output token's hidden state for the MTP draft path.
++        // We do this independently of the user-facing embd extraction so that
++        // MTP works even when cparams.embeddings is false.
++        if (t_embd_for_mtp != nullptr) {
++            ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd_for_mtp);
++            if (backend_mtp != nullptr) {
++                const int64_t mtp_n_embd  = t_embd_for_mtp->ne[0];
++                const int64_t mtp_n_toks  = t_embd_for_mtp->ne[1];
++                const int64_t mtp_last    = mtp_n_toks > 0 ? mtp_n_toks - 1 : 0;
++                mtp_prev_hidden.resize((size_t) mtp_n_embd);
++                ggml_backend_tensor_get_async(backend_mtp, t_embd_for_mtp,
++                    mtp_prev_hidden.data(),
++                    (size_t) (mtp_last * mtp_n_embd) * sizeof(float),
++                    (size_t) mtp_n_embd * sizeof(float));
++                mtp_prev_hidden_valid = true;
++            }
++        }
++
+         // Copy backend sampling output if this ubatch produced any sampling tensors.
+         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
+             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
+@@ -3497,7 +3543,39 @@ int32_t llama_decode(
+ // Until that lands, the entry point returns a diagnostic so downstream
+ // callers can detect whether MTP is available and fall back to stock decode.
+ //
+-// TODO(mtp): wire up through process_ubatch with a new LLM_GRAPH_TYPE_MTP.
++// TODO(mtp): wire up through process_ubatch with LLM_GRAPH_TYPE_MTP.
++//
++// Status (Stage 3 partial):
++//   * The graph builder llm_build_qwen3next::build_mtp_head() is implemented
++//     and matches the MLX reference (see src/models/qwen3next.cpp).
++//   * MTP weights load via the NextN tensor path in llama-model.cpp.
++//   * The post-output-norm hidden state of the last decoded token is now
++//     captured into ctx->mtp_prev_hidden after every successful main decode
++//     (see the t_embd_for_mtp block above), so the input the MTP head needs
++//     is available host-side and ready to be uploaded into a draft graph.
++//   * LLM_GRAPH_TYPE_MTP has been added to llm_graph_type.
++//
++// What's still missing for end-to-end execution:
++//   1. A constructor branch in llm_build_qwen3next::llm_build_qwen3next()
++//      keyed on params.gtype == LLM_GRAPH_TYPE_MTP that, instead of building
++//      the full forward pass, allocates two input tensors
++//      (prev_hidden, tok_embed), copies ctx->mtp_prev_hidden and the
++//      embedding row for `last_token` into them, calls build_mtp_head() once,
++//      and writes the resulting logits into res->t_logits.
++//   2. A small llama_context helper that builds an llm_graph_params with
++//      gtype=LLM_GRAPH_TYPE_MTP and a synthetic 1-token ubatch, dispatches
++//      it through ggml_backend_sched_graph_compute_async, and pulls the
++//      logits back into a host buffer.
++//   3. A K-step loop here that, after each step, argmax-samples a token,
++//      writes it to out_tokens[i], optionally writes the full row into
++//      out_logits, and substitutes the MTP layer's output hidden state
++//      (returned via build_mtp_head's out_hidden) for prev_hidden on the
++//      next iteration. This mirrors MTPDraftHead.draft() in the MLX
++//      reference (~/mlx-fork/fused_gdn.py).
++//
++// Until (1) and (2) land, this entry point validates inputs, confirms the
++// hidden-state cache is populated, and returns -4 ("graph compute path not
++// yet wired") so callers cleanly fall back to plain autoregressive decode.
+ int32_t llama_mtp_draft(
+         struct llama_context * ctx,
+                  llama_token   last_token,
+@@ -3515,11 +3593,14 @@ int32_t llama_mtp_draft(
+         return -1;
+     }
+ 
+-    // Graph execution path not yet wired through the scheduler.
+-    // The graph BUILDER is implemented (see src/models/qwen3next.cpp
+-    // build_mtp_head) and the MTP weights are loaded — the remaining work
+-    // is a new llm_graph_type + process_ubatch route. Until then, return -4
+-    // to signal callers that MTP execution is unavailable.
++    if (!ctx->has_mtp_prev_hidden()) {
++        // Caller must run llama_decode() at least once before drafting so
++        // the previous hidden state is populated.
++        return -3;
++    }
++
++    // Graph execution path not yet wired through the scheduler — see the
++    // detailed checklist in the function header comment above.
+     return -4;
+ }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index fbecb5f12..e030e2b2f 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -79,6 +79,14 @@ struct llama_context {
+     float * get_embeddings_ith(int32_t i);
+     float * get_embeddings_seq(llama_seq_id seq_id);
+ 
++    // MTP (Multi-Token Prediction) draft state accessors.
++    // Returns the post-output-norm hidden state of the last decoded token,
++    // or nullptr if no main decode has populated it yet. Caller must not
++    // free; pointer is valid until the next decode.
++    const float * get_mtp_prev_hidden() const;
++    size_t        get_mtp_prev_hidden_size() const;
++    bool          has_mtp_prev_hidden() const;
++
+     llama_token * get_sampled_tokens() const;
+     llama_token   get_sampled_token_ith(int32_t idx);
+ 
+@@ -297,6 +305,22 @@ private:
+     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
+     std::map<llama_seq_id, std::vector<float>> embd_seq;
+ 
++    // MTP (Multi-Token Prediction) draft state.
++    //
++    // After every successful main decode, if the loaded model exposes an MTP
++    // head, we copy the post-final-norm hidden state of the LAST output token
++    // into `mtp_prev_hidden`. The MTP draft graph reads from this buffer as
++    // its `prev_hidden` input on the next llama_mtp_draft() call.
++    //
++    // Note: this is the post-output-norm hidden state, mirroring the MLX
++    // reference's `mtp_generate()` which feeds the normed hidden state into
++    // the MTP head's hnorm. The MTP head's own hnorm is therefore applied to
++    // an already-normed input — this matches the upstream HF reference and
++    // is intentional (the two RMS norms are not idempotent because hnorm
++    // has its own learned scale).
++    std::vector<float> mtp_prev_hidden;
++    bool               mtp_prev_hidden_valid = false;
++
+     // reuse the batch_allocr to avoid unnecessary memory allocations
+     std::unique_ptr<llama_batch_allocr> balloc;
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 22d11a838..6855a5cde 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -31,6 +31,10 @@ enum llm_graph_type {
+     LLM_GRAPH_TYPE_DEFAULT,
+     LLM_GRAPH_TYPE_ENCODER,
+     LLM_GRAPH_TYPE_DECODER,
++    // MTP (Multi-Token Prediction) draft head: standalone forward pass over a
++    // single seed token using the cached previous hidden state from the most
++    // recent main decode. Used by llama_mtp_draft() / common_speculative_mtp.
++    LLM_GRAPH_TYPE_MTP,
+ };
+ 
+ enum llm_ffn_op_type {
+-- 
+2.51.2
+

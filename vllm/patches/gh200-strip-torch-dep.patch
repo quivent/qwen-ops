@@ -1,0 +1,20 @@
+From: Josh Kornreich <contact@eigen.codes>
+Subject: [PATCH] GH200: strip torch from install dependencies
+
+On GH200 (ARM64), the system PyTorch is pre-compiled for ARM+CUDA.
+pip installing vLLM normally will pull a CPU-only torch from PyPI,
+silently replacing the working one. This patch removes torch from
+vLLM's dependencies so the system torch is used instead.
+
+Apply after cloning vLLM:
+  git apply gh200-strip-torch-dep.patch
+
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [build-system]
+-requires = ["setuptools>=61", "wheel", "torch>=2.0"]
++requires = ["setuptools>=61", "wheel"]
+ build-backend = "setuptools.build_meta"
+
+ [project]

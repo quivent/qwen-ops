@@ -1,0 +1,310 @@
+--- vllm/model_executor/layers/mamba/gdn_linear_attn.py	2026-04-12 10:08:10.930944403 +0000
++++ vllm/model_executor/layers/mamba/gdn_linear_attn.py	2026-04-12 10:10:03.768835675 +0000
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Inference-only Qwen3-Next/Qwen3.5 model."""
+ 
++from __future__ import annotations
++
+ import torch
+ from einops import rearrange
+ from torch import nn
+@@ -199,6 +201,179 @@
+         )
+ 
+ 
++# ---------------------------------------------------------------------------
++# Recurrent-Rollback: O(1) state restoration for GDN layers
++# ---------------------------------------------------------------------------
++# During MTP speculative decoding verification, the model processes N draft
++# tokens through the GDN recurrence.  If verification rejects at position K,
++# the GDN state must be restored to its value after processing tokens 0..K-1.
++#
++# The GDN state update is non-invertible:
++#   S_{t+1} = g_t * S_t + beta_t * k_t * (v_t - k_t^T @ S_t)
++#
++# The retrieval term (k_t^T @ S_t) makes the update state-dependent.
++# You cannot undo a step without saving intermediate states.
++#
++# This module saves .clone() snapshots of the GDN recurrence state
++# (ssm_state) and conv1d state after each speculative token position
++# during the verification forward pass.  On rejection,
++# restore_state(position) restores both states in O(1) time (one copy
++# per layer) instead of recomputing the full forward pass.
++#
++# Memory cost for Qwen3.5-27B (TP=1) with MTP=5:
++#   ssm_state per layer: (num_v_heads, head_v_dim, head_k_dim) float32
++#       = (48, 128, 128) = 3.0 MB
++#   conv_state per layer: (conv_dim, kernel_size) ~= 0.1 MB
++#   48 layers * 6 positions * 3.1 MB = ~893 MB
++# This fits on a 5090 (32 GB) or GH200 (480 GB) alongside the model.
++#
++# Checkpoints are only saved when the manager is activated (during
++# verification), not during normal token-by-token generation.
++# ---------------------------------------------------------------------------
++
++
++class GDNRollbackCheckpoint:
++    """Snapshot of GDN conv_state and ssm_state at a token position.
++
++    Both tensors are .clone()d because PyTorch tensors are mutable
++    (unlike MLX arrays which are immutable / zero-copy).
++    """
++    __slots__ = ('position', 'conv_state', 'ssm_state')
++
++    def __init__(self, position: int, conv_state: torch.Tensor,
++                 ssm_state: torch.Tensor):
++        self.position = position
++        self.conv_state = conv_state.clone()
++        self.ssm_state = ssm_state.clone()
++
++
++class GDNRollbackManager:
++    """Manages per-position state checkpoints across all GDN layers.
++
++    Typical usage from the model-level verify/rollback flow::
++
++        manager = model.get_rollback_manager()
++
++        # Before verification forward pass:
++        manager.begin_verification()
++
++        # The forward pass runs normally -- GDN layers auto-save
++        # checkpoints when the manager is active.
++        logits = model.forward(draft_tokens)
++
++        # On rejection at position K:
++        model.rollback_gdn_state(K - 1, state_indices)
++
++        # After verification:
++        manager.end_verification()
++    """
++
++    def __init__(self, max_positions: int = 6):
++        self.max_positions = max_positions
++        self._active = False
++        # _checkpoints[layer_idx][position] = GDNRollbackCheckpoint
++        self._checkpoints: dict[int, dict[int, GDNRollbackCheckpoint]] = {}
++        # Pre-verification state (position -1)
++        self._pre_verify: dict[int, GDNRollbackCheckpoint] = {}
++
++    @property
++    def is_active(self) -> bool:
++        return self._active
++
++    def begin_verification(self):
++        """Enable checkpoint saving for the upcoming verify forward."""
++        self._active = True
++        self._checkpoints.clear()
++        self._pre_verify.clear()
++
++    def end_verification(self):
++        """Disable checkpoints and release memory."""
++        self._active = False
++        self._checkpoints.clear()
++        self._pre_verify.clear()
++
++    def save_pre_verify_state(self, layer_idx: int,
++                              conv_state: torch.Tensor,
++                              ssm_state: torch.Tensor,
++                              state_index: int):
++        """Snapshot the state *before* any draft tokens are processed.
++
++        Used when ALL draft tokens are rejected (restore to position -1).
++        """
++        if not self._active:
++            return
++        self._pre_verify[layer_idx] = GDNRollbackCheckpoint(
++            position=-1,
++            conv_state=conv_state[state_index],
++            ssm_state=ssm_state[state_index],
++        )
++
++    def save_checkpoint(self, layer_idx: int, position: int,
++                        conv_state: torch.Tensor,
++                        ssm_state: torch.Tensor,
++                        state_index: int):
++        """Snapshot state after processing the token at *position*.
++
++        Args:
++            layer_idx: Absolute layer index of the GDN layer.
++            position: 0-based position within the draft sequence.
++            conv_state: Full conv-state cache (we index by state_index).
++            ssm_state: Full ssm-state cache (we index by state_index).
++            state_index: Cache slot for this position.
++        """
++        if not self._active or position >= self.max_positions:
++            return
++        if layer_idx not in self._checkpoints:
++            self._checkpoints[layer_idx] = {}
++        self._checkpoints[layer_idx][position] = GDNRollbackCheckpoint(
++            position=position,
++            conv_state=conv_state[state_index],
++            ssm_state=ssm_state[state_index],
++        )
++
++    def restore_state(self, position: int,
++                      gdn_layers: list[tuple[int, GatedDeltaNetAttention]],
++                      state_index: int):
++        """Restore all GDN layers to state after token *position*.
++
++        Args:
++            position: Target position (-1 = pre-verification).
++            gdn_layers: List of (layer_idx, gdn_layer) pairs.
++            state_index: Cache slot to write the restored state into.
++        """
++        for layer_idx, gdn_layer in gdn_layers:
++            if position == -1:
++                ckpt = self._pre_verify.get(layer_idx)
++            else:
++                ckpt = self._checkpoints.get(layer_idx, {}).get(position)
++
++            if ckpt is None:
++                logger.warning(
++                    "No rollback checkpoint for layer %d position %d",
++                    layer_idx, position,
++                )
++                continue
++
++            kv_cache = gdn_layer.kv_cache
++            kv_cache[0][state_index].copy_(ckpt.conv_state)
++            kv_cache[1][state_index].copy_(ckpt.ssm_state)
++
++    def memory_usage_bytes(self, num_gdn_layers: int = 48) -> int:
++        """Estimate total memory used by checkpoints."""
++        # Each checkpoint = conv_state + ssm_state clones
++        n_ckpts = sum(len(v) for v in self._checkpoints.values())
++        n_ckpts += len(self._pre_verify)
++        if n_ckpts == 0:
++            return 0
++        # Sample a checkpoint to get sizes
++        sample = next(iter(self._pre_verify.values()), None)
++        if sample is None:
++            sample = next(iter(next(iter(self._checkpoints.values())).values()))
++        per_ckpt = (sample.conv_state.nelement() * sample.conv_state.element_size()
++                    + sample.ssm_state.nelement() * sample.ssm_state.element_size())
++        return n_ckpts * per_ckpt
++
++
+ @PluggableLayer.register("gated_delta_net_attention")
+ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
+     @property
+@@ -362,6 +537,11 @@
+             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+         )
+ 
++        # Recurrent-rollback: set externally by the model when spec
++        # decode is active.  None means rollback is disabled.
++        self._rollback_manager: GDNRollbackManager | None = None
++        self._layer_abs_idx: int = extract_layer_index(prefix)
++
+         compilation_config = get_current_vllm_config().compilation_config
+         if prefix in compilation_config.static_forward_context:
+             raise ValueError(f"Duplicate layer name: {prefix}")
+@@ -712,6 +892,16 @@
+         num_actual_tokens = attn_metadata.num_actual_tokens
+         num_accepted_tokens = attn_metadata.num_accepted_tokens
+ 
++        # Recurrent-rollback: save pre-verification state before any
++        # spec tokens modify the GDN state.
++        _rbm = self._rollback_manager
++        if (_rbm is not None and _rbm.is_active
++                and spec_state_indices_tensor is not None):
++            _pre_slot = spec_state_indices_tensor[0, 0].item()
++            if _pre_slot >= 0:
++                _rbm.save_pre_verify_state(
++                    self._layer_abs_idx, conv_state, ssm_state, _pre_slot)
++
+         mixed_qkv = mixed_qkv[:num_actual_tokens]
+         b = b[:num_actual_tokens]
+         a = a[:num_actual_tokens]
+@@ -822,6 +1012,17 @@
+                     use_qk_l2norm_in_kernel=True,
+                 )
+             )
++            # Recurrent-rollback: save per-position checkpoints.
++            # The fused kernel wrote state at ssm_state[slot] for each
++            # speculative position.  We snapshot those slots now.
++            if _rbm is not None and _rbm.is_active:
++                _n_spec = spec_state_indices_tensor.size(1)
++                for _pos in range(_n_spec):
++                    _slot = spec_state_indices_tensor[0, _pos].item()
++                    if _slot >= 0:
++                        _rbm.save_checkpoint(
++                            self._layer_abs_idx, _pos,
++                            conv_state, ssm_state, _slot)
+         else:
+             core_attn_out_spec, last_recurrent_state = None, None
+ 
+---
+--- vllm/model_executor/models/qwen3_5.py	2026-04-12 10:10:09.198878565 +0000
++++ vllm/model_executor/models/qwen3_5.py	2026-04-12 10:10:28.846033751 +0000
+@@ -247,6 +247,68 @@
+ 
+         self.aux_hidden_state_layers: tuple[int, ...] = ()
+ 
++    # ------------------------------------------------------------------
++    # Recurrent-rollback API
++    # ------------------------------------------------------------------
++
++    def setup_rollback_manager(self, max_positions: int = 6):
++        """Create and attach a GDNRollbackManager to all GDN layers.
++
++        Call once during model init when speculative decoding is enabled.
++        The manager is shared across all GDN layers.
++
++        Args:
++            max_positions: Maximum speculative positions to checkpoint
++                (typically num_speculative_tokens + 1).
++        """
++        from vllm.model_executor.layers.mamba.gdn_linear_attn import (
++            GDNRollbackManager,
++        )
++        self._rollback_manager = GDNRollbackManager(
++            max_positions=max_positions)
++        self._gdn_layers: list[tuple[int, object]] = []
++        for layer in self.layers:
++            if (hasattr(layer, 'layer_type')
++                    and layer.layer_type == "linear_attention"):
++                gdn = layer.linear_attn
++                gdn._rollback_manager = self._rollback_manager
++                self._gdn_layers.append((gdn._layer_abs_idx, gdn))
++
++    def begin_verification(self):
++        """Enable checkpoint saving for the upcoming verify forward."""
++        if hasattr(self, '_rollback_manager'):
++            self._rollback_manager.begin_verification()
++
++    def end_verification(self):
++        """Disable checkpoints and release memory."""
++        if hasattr(self, '_rollback_manager'):
++            self._rollback_manager.end_verification()
++
++    def rollback_gdn_state(self, position: int, state_index: int):
++        """Restore GDN state across all layers to after token *position*.
++
++        Call when MTP verification rejects at position K::
++
++            model.rollback_gdn_state(K - 1, state_index=slot_id)
++
++        This restores both conv_state and ssm_state for all 48 GDN
++        layers in O(num_layers) time (~0.15 ms total).
++
++        Args:
++            position: Target position (-1 = pre-verification).
++            state_index: Cache slot for the request being rolled back.
++        """
++        if not hasattr(self, '_rollback_manager'):
++            raise RuntimeError(
++                "Rollback manager not initialized. "
++                "Call setup_rollback_manager() first.")
++        self._rollback_manager.restore_state(
++            position, self._gdn_layers, state_index)
++
++    def get_rollback_manager(self):
++        """Return the rollback manager, or None if not set up."""
++        return getattr(self, '_rollback_manager', None)
++
+     def load_fused_expert_weights(
+         self,
+         name: str,

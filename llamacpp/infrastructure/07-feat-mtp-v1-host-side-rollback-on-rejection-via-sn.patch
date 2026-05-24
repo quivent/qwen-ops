@@ -1,0 +1,248 @@
+From 568c910cf389d4dae65184183e325ba750546a0e Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 18:30:13 -0400
+Subject: [PATCH] feat(mtp): v1 host-side rollback on rejection via snapshot +
+ attn-only seq_rm
+
+Adds llama_memory_seq_rm_attn_only() which trims only the attention
+half of a hybrid (attn+recurrent) memory, leaving the recurrent side
+untouched. This is the missing primitive for split-recurrence rollback:
+after llama_memory_restore_recurrent() rewinds the DeltaNet state, the
+attention KV still holds the rejected-draft entries and must be trimmed
+without triggering llama_memory_recurrent's partial-tail refusal.
+
+Wires the new primitive into the mtp-speculative example. On rejection:
+  1. restore recurrent state to pre-verify snapshot
+  2. attn-only seq_rm back to pre-verify position
+  3. re-decode [id_last, accepted_drafts, correction] as one batch
+
+This eliminates the 'v1 no-trim workaround' that left rejected drafts
+contaminating both the attention context and the DeltaNet recurrent
+state, and should recover the sustained throughput that dropped from
+1.44x to 0.81x at n=64 on Qwen3.5-27B.
+---
+ examples/mtp-speculative/mtp-speculative.cpp | 122 ++++++++++++-------
+ include/llama.h                              |  16 +++
+ src/llama-context.cpp                        |  41 +++++++
+ 3 files changed, 138 insertions(+), 41 deletions(-)
+
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+index 286068e49..49934525d 100644
+--- a/examples/mtp-speculative/mtp-speculative.cpp
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -255,52 +255,92 @@ int main(int argc, char ** argv) {
+             common_speculative_mtp_note_committed(spec, 1);
+             LOG("%s", common_token_to_piece(ctx_tgt, corr).c_str());
+ 
+-            // ROLLBACK STRATEGY (v1): rejection without trim.
++            // ROLLBACK STRATEGY (v1 host-side):
+             //
+-            // The ideal flow is: trim the KV cache back to `keep_end`
+-            // (= n_past + 1 + n_accepted) and re-decode the correction at
+-            // position keep_end. This requires rolling back BOTH the attention
+-            // KV cache AND the DeltaNet recurrent state by `n_drafted - n_accepted`
+-            // positions.
++            // 1. Restore the recurrent (DeltaNet) state to its pre-verify
++            //    snapshot. After this, the recurrent cache believes it never
++            //    saw any of the K+1 verify tokens.
++            // 2. Trim ONLY the attention-side KV back to the pre-verify
++            //    position. We can't use the hybrid llama_memory_seq_rm() here
++            //    because it would try to seq_rm the recurrent side too, and
++            //    (a) we've already restored it, (b) llama_memory_recurrent
++            //    refuses partial tail removal anyway. The new
++            //    llama_memory_seq_rm_attn_only() bypasses both issues.
++            // 3. Re-decode [id_last, d_0, .., d_{n_accepted-1}, corr] as a
++            //    single batch at positions [n_past .. n_past+n_accepted+1].
++            //    This advances the recurrent state through exactly the tokens
++            //    that are being committed, with no contamination from the
++            //    rejected drafts.
+             //
+-            // llama.cpp's llama_memory_recurrent::seq_rm refuses partial tail
+-            // removal (see llama-memory-recurrent.cpp:164-168) because the
+-            // recurrent state is irreversible — the only legal operations are
+-            // "clear the whole sequence" or "no-op". llama_memory_seq_rm on the
+-            // hybrid memory therefore returns false without trimming either
+-            // half, leaving both at position n_past + n_drafted.
+-            //
+-            // Proper fix: split-recurrence per-token state capture, as in the
+-            // quivent/recurrent-rollback Python library. This is a non-trivial
+-            // ggml refactor — see MTP_TODO_LATER.md.
+-            //
+-            // v1 workaround: don't trim. Leave the rejected drafts in the KV
+-            // cache as polluted context. Feed the correction token at the
+-            // post-verify position (n_past + 1 + n_drafted) and continue.
+-            // Costs: (a) the rejected drafts remain in attention context for
+-            // future decodes (quality hit), (b) the recurrent state has
+-            // absorbed the rejected drafts' updates (also quality hit).
+-            // Benefit: the pipeline runs end-to-end and we can measure MTP
+-            // acceptance rate and generation throughput.
+-            (void) snap;
+-
+-            const llama_pos corr_pos = n_past + 1 + n_drafted;
+-            verify_batch.n_tokens     = 1;
+-            verify_batch.token[0]     = corr;
+-            verify_batch.pos[0]       = corr_pos;
++            // On accept-all we skip the restore (the verify decode already
++            // advanced both caches correctly).
++
++            if (snap != nullptr) {
++                const int32_t restore_rc = llama_memory_restore_recurrent(ctx_tgt, snap);
++                if (restore_rc != 0) {
++                    LOG_ERR("%s: recurrent restore failed (rc=%d)\n", __func__, restore_rc);
++                    llama_memory_release_snapshot(snap);
++                    snap = nullptr;
++                    break;
++                }
++                if (!llama_memory_seq_rm_attn_only(ctx_tgt, 0, n_past, -1)) {
++                    LOG_ERR("%s: attn-only seq_rm failed\n", __func__);
++                    llama_memory_release_snapshot(snap);
++                    snap = nullptr;
++                    break;
++                }
++            }
++
++            // Re-decode: id_last + n_accepted drafts + correction.
++            const int32_t n_commit = 1 + n_accepted + 1; // id_last, drafts[0..n_accepted-1], corr
++            verify_batch.n_tokens     = n_commit;
++            verify_batch.token[0]     = id_last;
++            verify_batch.pos[0]       = n_past;
+             verify_batch.n_seq_id[0]  = 1;
+             verify_batch.seq_id[0][0] = 0;
+-            verify_batch.logits[0]    = 1;
+-            if (llama_decode(ctx_tgt, verify_batch) != 0) {
+-                LOG_ERR("%s: correction decode failed\n", __func__);
+-                llama_memory_release_snapshot(snap);
+-                snap = nullptr;
+-                break;
++            verify_batch.logits[0]    = 0;
++            for (int32_t i = 0; i < n_accepted; ++i) {
++                verify_batch.token[1 + i]     = drafts[i];
++                verify_batch.pos[1 + i]       = n_past + 1 + i;
++                verify_batch.n_seq_id[1 + i]  = 1;
++                verify_batch.seq_id[1 + i][0] = 0;
++                verify_batch.logits[1 + i]    = 0;
++            }
++            const int32_t corr_slot = 1 + n_accepted;
++            verify_batch.token[corr_slot]     = corr;
++            verify_batch.pos[corr_slot]       = n_past + 1 + n_accepted;
++            verify_batch.n_seq_id[corr_slot]  = 1;
++            verify_batch.seq_id[corr_slot][0] = 0;
++            verify_batch.logits[corr_slot]    = 1; // need logits at the correction slot for next round's draft seed
++
++            if (snap == nullptr) {
++                // No rollback available: fall back to the legacy no-trim path
++                // (just decode corr at the post-verify position to keep the
++                // pipeline moving).
++                verify_batch.n_tokens     = 1;
++                verify_batch.token[0]     = corr;
++                verify_batch.pos[0]       = n_past + 1 + n_drafted;
++                verify_batch.n_seq_id[0]  = 1;
++                verify_batch.seq_id[0][0] = 0;
++                verify_batch.logits[0]    = 1;
++                if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                    LOG_ERR("%s: correction decode failed (no-rollback path)\n", __func__);
++                    break;
++                }
++                common_speculative_mtp_note_forward_pass(spec);
++                n_past  = n_past + 1 + n_drafted + 1;
++                id_last = corr;
++            } else {
++                if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                    LOG_ERR("%s: rollback re-decode failed\n", __func__);
++                    llama_memory_release_snapshot(snap);
++                    snap = nullptr;
++                    break;
++                }
++                common_speculative_mtp_note_forward_pass(spec);
++                n_past  += n_commit;
++                id_last = corr;
+             }
+-            common_speculative_mtp_note_forward_pass(spec);
+-
+-            n_past  = corr_pos + 1;
+-            id_last = corr;
+         } else {
+             // All drafts accepted: the logits at the final slot give the
+             // next token. Note: that next token's KV entry is NOT yet in
+diff --git a/include/llama.h b/include/llama.h
+index c35617e6a..72fba90e7 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -855,6 +855,22 @@ extern "C" {
+     LLAMA_API size_t llama_memory_snapshot_size(
+             llama_memory_recurrent_snapshot_t handle);
+ 
++    // Trim ONLY the attention-side KV cache for a hybrid (attn+recurrent)
++    // memory. Used by split-recurrence rollback: the caller has already
++    // restored the recurrent state via llama_memory_restore_recurrent(),
++    // so the recurrent side must not be touched (and the hybrid
++    // llama_memory_seq_rm() would refuse partial-tail trim on the recurrent
++    // side anyway).
++    //
++    // For pure KV memory this is equivalent to llama_memory_seq_rm().
++    // For pure recurrent memory this is a no-op returning true.
++    // Returns true on success, false if the attention seq_rm fails.
++    LLAMA_API bool llama_memory_seq_rm_attn_only(
++            struct llama_context * ctx,
++            llama_seq_id           seq_id,
++            llama_pos              p0,
++            llama_pos              p1);
++
+     //
+     // State / sessions
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c7773c12b..114464ca7 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3318,6 +3318,47 @@ size_t llama_memory_snapshot_size(llama_memory_recurrent_snapshot_t handle) {
+     return handle->bytes;
+ }
+ 
++// Trim ONLY the attention-side KV cache for a hybrid (attn+recurrent) memory.
++// Used by split-recurrence rollback: the caller has already restored recurrent
++// state via llama_memory_restore_recurrent(), so the recurrent side must NOT
++// be touched (and its book-keeping already reflects the pre-verify state, so a
++// second seq_rm against a range it "never saw" would be a no-op anyway — but
++// we still want to bypass the partial-tail refusal in llama_memory_recurrent).
++//
++// For pure KV (non-hybrid) memory this is equivalent to llama_memory_seq_rm.
++// For pure recurrent (non-hybrid) memory this is a no-op.
++// Returns true on success, false if the underlying attention seq_rm fails.
++bool llama_memory_seq_rm_attn_only(
++        struct llama_context * ctx,
++        llama_seq_id seq_id,
++        llama_pos    p0,
++        llama_pos    p1) {
++    if (ctx == nullptr) {
++        return false;
++    }
++    llama_memory_t mem = ctx->get_memory();
++    if (mem == nullptr) {
++        return true;
++    }
++
++    // Hybrid: trim only the attention half.
++    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
++        auto * attn = hyb->get_mem_attn();
++        if (attn == nullptr) {
++            return true;
++        }
++        return attn->seq_rm(seq_id, p0, p1);
++    }
++
++    // Pure recurrent: rollback already done via snapshot restore; nothing to do.
++    if (dynamic_cast<llama_memory_recurrent *>(mem) != nullptr) {
++        return true;
++    }
++
++    // Pure KV or other: defer to the normal seq_rm path.
++    return mem->seq_rm(seq_id, p0, p1);
++}
++
+ // Socratic Tuner: set/swap eval callback per-request
+ void llama_set_eval_callback(
+         struct llama_context * ctx,
+-- 
+2.51.2
+

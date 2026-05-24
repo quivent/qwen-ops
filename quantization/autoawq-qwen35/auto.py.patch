@@ -1,0 +1,9 @@
+--- a/awq/models/auto.py
++++ b/awq/models/auto.py
+@@ -44,7 +44,8 @@
+     "qwen2_vl": Qwen2VLAWQForCausalLM,
+     "qwen2_5_vl": Qwen2_5_VLAWQForCausalLM,
+-    "qwen2_5_omni": Qwen2_5_OmniAWQForConditionalGeneration
++    "qwen2_5_omni": Qwen2_5_OmniAWQForConditionalGeneration,
++    "qwen3_5": Qwen3_5AWQForCausalLM,
+ }

@@ -1,0 +1,227 @@
+--- vllm/v1/spec_decode/eagle.py	2026-04-02 23:48:32.000000000 +0000
++++ /home/ubuntu/.local/lib/python3.10/site-packages/vllm/v1/spec_decode/eagle.py	2026-04-11 08:26:54.146726321 +0000
+@@ -77,6 +77,18 @@
+         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+ 
++        # Adaptive chained MTP configuration (env vars match llama.cpp interface)
++        import os
++        self.mtp_chain_kmax = int(os.environ.get("MTP_CHAIN_KMAX", "0"))
++        self.mtp_chain_thresh = float(os.environ.get("MTP_CHAIN_THRESH", "0.85"))
++        self._chain_stats = {"attempts": 0, "chains": 0, "tokens": 0}
++        self._chain_log_interval = 100
++        if self.mtp_chain_kmax > 0:
++            logger.info(
++                "Adaptive chained MTP enabled: KMAX=%d, THRESH=%.2f",
++                self.mtp_chain_kmax, self.mtp_chain_thresh,
++            )
++
+         # We need to get the hidden size from the draft model config because
+         # the draft model's hidden size can be different from the target model's
+         # hidden size (e.g., Llama 3.3 70B).
+@@ -641,7 +653,92 @@
+             draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
+             draft_token_ids_list.append(draft_token_ids)
+ 
++            # Adaptive chained MTP: if confidence is high, re-run the
++            # full MTP forward with the output hidden fed back as
++            # prev_hidden. Bypasses torch.compile by calling forward()
++            # directly. Total draft budget is num_speculative_tokens.
++            if (self.mtp_chain_kmax > 0
++                    and self.pass_hidden_states_to_model
++                    and len(draft_token_ids_list)
++                    < self.num_speculative_tokens):
++                chain_hidden = last_hidden_states[:batch_size]
++                self._chain_stats["attempts"] += 1
++                chain_produced = 0
++                for _chain_step in range(self.mtp_chain_kmax):
++                    if len(draft_token_ids_list) \
++                            >= self.num_speculative_tokens:
++                        break
++                    # Check confidence before committing to chain
++                    logits = self.model.compute_logits(chain_hidden)
++                    if logits is None:
++                        break
++                    probs = torch.softmax(logits, dim=-1)
++                    top1_conf, _ = probs.max(dim=-1)
++                    min_conf = top1_conf.min().item()
++                    if min_conf < self.mtp_chain_thresh:
++                        break
++                    # Full MTP forward — use the inner model
++                    # (MultiTokenPredictor) directly to bypass
++                    # torch.compile and CUDA graph wrappers
++                    chain_input_ids = draft_token_ids_list[-1].int()
++                    self.input_ids[:batch_size] = chain_input_ids
++                    self.hidden_states[:batch_size] = chain_hidden
++                    # Pass inputs_embeds as the actual embeddings
++                    # to avoid AOT compile None issue
++                    chain_embeds = self.model.embed_input_ids(
++                        self.input_ids[:input_batch_size])
++                    chain_model_kwargs = {
++                        "input_ids":
++                            self.input_ids[:input_batch_size],
++                        "positions":
++                            self._get_positions(input_batch_size),
++                        "inputs_embeds": chain_embeds,
++                    }
++                    if self.pass_hidden_states_to_model:
++                        chain_model_kwargs["hidden_states"] = \
++                            self.hidden_states[:input_batch_size]
++                    # Same call path as the normal draft loop
++                    with set_forward_context(
++                        per_layer_attn_metadata,
++                        self.vllm_config,
++                        num_tokens=input_batch_size,
++                        num_tokens_across_dp=batch_size_across_dp,
++                        cudagraph_runtime_mode=
++                            cudagraph_runtime_mode,
++                        slot_mapping=self._get_slot_mapping(
++                            input_batch_size),
++                    ):
++                        ret = self.model(**chain_model_kwargs)
++                        if not self.model_returns_tuple():
++                            chain_hidden = ret
++                        else:
++                            chain_hidden, _ = ret
++                    chain_hidden = chain_hidden[:batch_size]
++                    chain_draft = self._greedy_sample(chain_hidden)
++                    draft_token_ids_list.append(chain_draft)
++                    chain_produced += 1
++                if chain_produced > 0:
++                    self._chain_stats["chains"] += 1
++                    self._chain_stats["tokens"] += chain_produced
++                if self._chain_stats["attempts"] % self._chain_log_interval == 0 and self._chain_stats["attempts"] > 0:
++                    s = self._chain_stats
++                    logger.info(
++                        "Chain stats: %d attempts, %d chains (%.1f%%), %d extra tokens (%.2f/chain)",
++                        s["attempts"], s["chains"],
++                        100*s["chains"]/max(1,s["attempts"]),
++                        s["tokens"],
++                        s["tokens"]/max(1,s["chains"]),
++                    )
++
++            # If chaining filled the budget, break the outer loop
++            if len(draft_token_ids_list) >= self.num_speculative_tokens:
++                break
++
+         # [batch_size, num_speculative_tokens]
++        # Pad or truncate to exactly num_speculative_tokens columns
++        if len(draft_token_ids_list) > self.num_speculative_tokens:
++            draft_token_ids_list = \
++                draft_token_ids_list[:self.num_speculative_tokens]
+         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+         return draft_token_ids
+ 
+@@ -967,21 +1064,28 @@
+         tree_input_ids = torch.empty(
+             0, device=self.input_ids.device, dtype=self.input_ids.dtype
+         )
+-        tree_positions = torch.empty(
+-            0, device=self.positions.device, dtype=self.positions.dtype
+-        )
+         tree_hidden_states = torch.empty(
+             0, device=self.hidden_states.device, dtype=self.hidden_states.dtype
+         )
++        # For MRoPE models (e.g. Qwen3.5), positions has shape (3, num_tokens).
++        # Extract 1D positions for scalar arithmetic; all MRoPE dims are
++        # identical for text-only inputs.
++        if self.uses_mrope:
++            positions_1d = positions[0]
++        else:
++            positions_1d = positions
++        tree_positions = torch.empty(
++            0, device=positions_1d.device, dtype=positions_1d.dtype
++        )
+         # Precompute the draft token positions.
+         flattened_draft_positions = (
+-            positions.view(batch_size, -1) + self.tree_draft_pos_offsets[:batch_size, :]
++            positions_1d.view(batch_size, -1) + self.tree_draft_pos_offsets[:batch_size, :]
+         )
+         tree_depth = len(self.cu_drafts_per_level)
+         for level in range(tree_depth - 1):
+             # Get draft positions for RoPE.
+-            draft_positions = positions + (level + 1)
+-            exceeds_max_model_len = (positions + total_num_drafts) >= self.max_model_len
++            draft_positions = positions_1d + (level + 1)
++            exceeds_max_model_len = (positions_1d + total_num_drafts) >= self.max_model_len
+             # Mask out the position ids that exceed the max model length.
+             # Otherwise, we may get out-of-range error in RoPE.
+             draft_positions = torch.where(
+@@ -1053,7 +1157,13 @@
+             num_tokens = attn_metadata.num_actual_tokens
+             input_ids = tree_input_ids.view(-1)
+             self.input_ids[:num_tokens] = input_ids
+-            self.positions[:num_tokens] = tree_positions.view(-1)
++            # For MRoPE, expand 1D tree positions to (3, num_tokens).
++            if self.uses_mrope:
++                flat_tree_pos = tree_positions.view(-1)
++                mrope_tree_pos = flat_tree_pos.unsqueeze(0).expand(3, -1)
++                self._set_positions(num_tokens, mrope_tree_pos)
++            else:
++                self._set_positions(num_tokens, tree_positions.view(-1))
+             self.hidden_states[:num_tokens] = tree_hidden_states.view(num_tokens, -1)
+ 
+             cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+@@ -1070,12 +1180,17 @@
+                     num_input_tokens, attn_metadata.slot_mapping
+                 ),
+             ):
+-                last_hidden_states, hidden_states = self.model(
++                ret = self.model(
+                     input_ids=self.input_ids[:num_input_tokens],
+-                    positions=self.positions[:num_input_tokens],
++                    positions=self._get_positions(num_input_tokens),
+                     hidden_states=self.hidden_states[:num_input_tokens],
+                     inputs_embeds=None,
+                 )
++                if not self.model_returns_tuple():
++                    last_hidden_states = ret
++                    hidden_states = ret
++                else:
++                    last_hidden_states, hidden_states = ret
+ 
+             # Get the output hidden states for the draft tokens.
+             draft_hidden_states = hidden_states[:num_tokens].view(
+@@ -1244,6 +1359,9 @@
+         return model
+ 
+     def load_model(self, target_model: nn.Module) -> None:
++        # Store reference to target model for modal forward
++        self._target_model = target_model
++
+         target_attn_layer_names = set(
+             get_layers_from_vllm_config(
+                 self.vllm_config,
+@@ -1536,6 +1654,32 @@
+                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                 self.model(**kwargs)
+ 
++        # Warm up the chain path with inputs_embeds as a tensor
++        # so AOT compilation and CUDA graphs capture this variant
++        if self.mtp_chain_kmax > 0 and self.pass_hidden_states_to_model:
++            cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
++                self._determine_batch_execution_and_padding(
++                    num_tokens, use_cudagraphs=use_cudagraphs
++                )
++            )
++            chain_embeds = self.model.embed_input_ids(
++                self.input_ids[:num_input_tokens])
++            chain_kwargs = dict(
++                input_ids=self.input_ids[:num_input_tokens],
++                positions=self._get_positions(num_input_tokens),
++                inputs_embeds=chain_embeds,
++                hidden_states=self.hidden_states[:num_input_tokens],
++            )
++            with set_forward_context(
++                None,
++                self.vllm_config,
++                num_tokens=num_input_tokens,
++                num_tokens_across_dp=num_tokens_across_dp,
++                cudagraph_runtime_mode=cudagraph_runtime_mode,
++                slot_mapping=slot_mappings or {},
++            ):
++                self.model(**chain_kwargs)
++
+     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
+         """
+         Some eagle3 heads (e.g., nvidia/gpt-oss-120b-Eagle3-v2) do not use auxiliary

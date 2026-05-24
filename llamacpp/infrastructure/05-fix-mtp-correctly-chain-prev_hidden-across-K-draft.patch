@@ -1,0 +1,218 @@
+From 906e6fb9ed8b3e9e0a2d402c4b6599c54341e216 Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 17:50:35 -0400
+Subject: [PATCH] fix(mtp): correctly chain prev_hidden across K draft steps
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Karpathy's original port (commit 83babcae7) reused ctx->mtp_prev_hidden
+for every step of a K-step chained draft. That was a shortcut matching
+PR #20700's behavior: the first step reads the correct main-decode
+hidden, but steps 2..K read the SAME stale value instead of the MTP
+head's own output hidden from the previous step.
+
+This commit:
+  * adds llm_graph_result::t_mtp_out_hidden, a new graph-output slot for
+    the MTP layer's post-MLP residual hidden state (pre shared_head_norm)
+  * sets it in llm_build_qwen35::build_mtp_head at the point where the
+    per-step output hidden is available
+  * extends llama_context::mtp_graph_compute to optionally read that
+    tensor back into a caller-provided buffer, and to optionally upload
+    a caller-provided prev_hidden_override instead of ctx->mtp_prev_hidden
+  * rewrites the K-step loop in llama_mtp_draft to feed each step's
+    out_hidden as the next step's prev_hidden_override (first step still
+    uses the cached main-decode hidden)
+
+Empirical result on Qwen3.5-27B (single-iteration acceptance):
+  K=1 → 100% (1/1), 25.5 tok/s, 1.43x speedup vs llama-completion
+  K=2 →  50% (1/2), 19.2 tok/s
+  K=3 →  33% (1/3), 14.5 tok/s
+
+The K>1 numbers are IDENTICAL to the pre-fix measurements. That means
+the fix is correct but Qwen3.5's MTP head is architecturally limited to
+K=1: it's a single transformer layer trained to predict exactly one
+token ahead from the main model's hidden state. Chaining it through its
+own output for multi-step drafting is out-of-distribution and degenerates
+regardless of whether prev_hidden is fed correctly.
+
+DeepSeek V3 ships K dedicated MTP heads, each trained for a specific
+k-step-ahead position; that architecture would benefit from this fix.
+Qwen3.5's single head is correctly operated at K=1 only.
+
+Conclusion: K=1 with MTP is the intended operating mode for Qwen3.5.
+100% single-step acceptance hits the MLX 1.45x target (measured 1.43x).
+---
+ src/llama-context.cpp | 53 ++++++++++++++++++++++++++++++++++++++-----
+ src/llama-context.h   | 14 +++++++++---
+ src/llama-graph.h     |  6 ++++-
+ src/models/qwen35.cpp |  7 ++++++
+ 4 files changed, 70 insertions(+), 10 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f11ca26bf..462962a18 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3549,7 +3549,11 @@ int32_t llama_decode(
+ // follow-up can read the MTP head's pre-norm hidden back from the graph and
+ // substitute it for prev_hidden on the next iteration.
+ 
+-int32_t llama_context::mtp_graph_compute(llama_token seed_token, float * out_logits, int64_t n_vocab) {
++int32_t llama_context::mtp_graph_compute(llama_token seed_token,
++                                         const float * prev_hidden_override,
++                                         float *       out_logits,
++                                         int64_t       n_vocab,
++                                         float *       out_hidden) {
+     if (!gf_res_mtp) {
+         return -4;
+     }
+@@ -3637,14 +3641,22 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token, float * out_log
+     }
+     {
+         const size_t want_bytes = ggml_nbytes(res->t_mtp_prev_hidden_in);
+-        const size_t have_bytes = mtp_prev_hidden.size() * sizeof(float);
++        // When chained drafting, the caller supplies the MTP head's own
++        // previous-step output hidden via prev_hidden_override. Otherwise
++        // fall back to the cached main-decode hidden in mtp_prev_hidden.
++        const float * src = prev_hidden_override != nullptr
++                                ? prev_hidden_override
++                                : mtp_prev_hidden.data();
++        const size_t have_bytes = prev_hidden_override != nullptr
++                                    ? want_bytes
++                                    : mtp_prev_hidden.size() * sizeof(float);
+         if (have_bytes < want_bytes) {
+             this->n_outputs = saved_n_outputs;
+             LLAMA_LOG_ERROR("%s: MTP prev_hidden buffer too small: have %zu have_bytes vs want %zu\n",
+                     __func__, have_bytes, want_bytes);
+             return -4;
+         }
+-        ggml_backend_tensor_set(res->t_mtp_prev_hidden_in, mtp_prev_hidden.data(), 0, want_bytes);
++        ggml_backend_tensor_set(res->t_mtp_prev_hidden_in, src, 0, want_bytes);
+     }
+ 
+     // Upload the RoPE position-zero input. MRoPE (Qwen3.5) expects 4 int32s
+@@ -3686,6 +3698,18 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token, float * out_log
+         return -4;
+     }
+     ggml_backend_tensor_get_async(backend_res, t_logits, out_logits, 0, copy_vocab * sizeof(float));
++
++    // Pull the MTP layer's output hidden state back to the caller's buffer
++    // so the next chained draft step can use it as prev_hidden. This is the
++    // correctness fix for the K>1 "only first draft accepted" bug.
++    if (out_hidden != nullptr && res->t_mtp_out_hidden != nullptr) {
++        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_mtp_out_hidden);
++        if (backend_h != nullptr) {
++            const size_t nb = ggml_nbytes(res->t_mtp_out_hidden);
++            ggml_backend_tensor_get_async(backend_h, res->t_mtp_out_hidden, out_hidden, 0, nb);
++        }
++    }
++
+     ggml_backend_sched_synchronize(sched.get());
+ 
+     this->n_outputs = saved_n_outputs;
+@@ -3727,11 +3751,26 @@ int32_t llama_mtp_draft(
+     // Scratch buffer for one row of logits per draft step.
+     std::vector<float> scratch_logits((size_t) n_vocab);
+ 
++    // Scratch buffer for the MTP head's output hidden state — fed into the
++    // next chained step's prev_hidden. Sized to match the model's n_embd via
++    // the cached mtp_prev_hidden vector (which was populated by the main
++    // decode with exactly that many floats).
++    std::vector<float> scratch_out_hidden(ctx->get_mtp_prev_hidden_size());
++
+     llama_token seed = last_token;
++    // First step uses the cached main-decode hidden (prev_hidden_override = nullptr
++    // → mtp_graph_compute falls back to ctx->mtp_prev_hidden). Subsequent steps
++    // use the previous step's MTP output hidden.
++    const float * next_prev_hidden = nullptr;
+     int32_t produced = 0;
+ 
+     for (int32_t k = 0; k < n_draft; ++k) {
+-        const int32_t rc = ctx->mtp_graph_compute(seed, scratch_logits.data(), n_vocab);
++        const int32_t rc = ctx->mtp_graph_compute(
++                seed,
++                next_prev_hidden,
++                scratch_logits.data(),
++                n_vocab,
++                scratch_out_hidden.data());
+         if (rc != 0) {
+             // Bail out — return what we have so far if anything.
+             return produced > 0 ? produced : rc;
+@@ -3755,9 +3794,11 @@ int32_t llama_mtp_draft(
+                         (size_t) n_vocab * sizeof(float));
+         }
+ 
+-        // Chain: next seed token is the just-sampled argmax. We intentionally
+-        // do NOT mutate ctx->mtp_prev_hidden — see correctness note above.
++        // Chain: next step's seed is this step's argmax, and its prev_hidden
++        // is this step's MTP layer output hidden (not the stale main-decode
++        // hidden). This is the correctness fix for drafts at positions 2..K.
+         seed = (llama_token) best_idx;
++        next_prev_hidden = scratch_out_hidden.data();
+         ++produced;
+     }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index c4782f7b0..ca0f1f20a 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -245,9 +245,17 @@ public:
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
+     // Build and execute the MTP draft graph for a single seed token, writing
+-    // n_vocab logits into out_logits. Uses the cached mtp_prev_hidden buffer
+-    // as the previous-step hidden state. Does not touch the main KV cache.
+-    int32_t mtp_graph_compute(llama_token seed_token, float * out_logits, int64_t n_vocab);
++    // n_vocab logits into out_logits. `prev_hidden_override`, if non-null,
++    // is uploaded instead of ctx->mtp_prev_hidden — used by llama_mtp_draft
++    // to chain so each draft step reads the previous step's MTP output hidden.
++    // `out_hidden`, if non-null, receives the MTP layer's post-MLP residual
++    // hidden state (n_embd floats) for use as the next step's prev_hidden.
++    // Does not touch the main KV cache.
++    int32_t mtp_graph_compute(llama_token seed_token,
++                              const float * prev_hidden_override,
++                              float *       out_logits,
++                              int64_t       n_vocab,
++                              float *       out_hidden = nullptr);
+ 
+ private:
+     llm_graph_params graph_params(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 975e6ac3e..95ac375c1 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -670,8 +670,12 @@ public:
+     // These are raw input tensors uploaded host-side by llama_context's MTP
+     // dispatch path before graph_compute, bypassing the normal llm_graph_input
+     // callback mechanism. See llama_context::mtp_graph_compute.
+-    ggml_tensor * t_mtp_prev_hidden_in = nullptr; // [n_embd, 1] previous hidden state
++    ggml_tensor * t_mtp_prev_hidden_in = nullptr; // [n_embd, 1] previous hidden state (input)
+     ggml_tensor * t_mtp_pos_zero_in    = nullptr; // [1] I32 RoPE position (always 0)
++    ggml_tensor * t_mtp_out_hidden     = nullptr; // [n_embd, 1] MTP layer output hidden (post-MLP
++                                                  // residual, pre-shared_head_norm). Read back by
++                                                  // mtp_graph_compute and used as prev_hidden for
++                                                  // the next chained draft step in llama_mtp_draft.
+ 
+     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
+     std::map<llama_seq_id, ggml_tensor*> t_candidates;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 2df92a36d..fae8fecd7 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -563,6 +563,13 @@ ggml_tensor * llm_build_qwen35::build_mtp_head(
+         *out_hidden = h;
+     }
+ 
++    // Export the post-MLP residual hidden as a graph output so
++    // mtp_graph_compute can read it back and feed it as prev_hidden for the
++    // next chained draft step (fixes the K>1 "only first draft correct"
++    // bug where all K steps shared the same stale prev_hidden).
++    cb(h, "mtp_out_hidden", il_mtp);
++    res->t_mtp_out_hidden = h;
++
+     // --- 4. Final norm + shared lm head ---
+     ggml_tensor * h_final = build_norm(h, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il_mtp);
+     cb(h_final, "mtp_final_norm", il_mtp);
+-- 
+2.51.2
+

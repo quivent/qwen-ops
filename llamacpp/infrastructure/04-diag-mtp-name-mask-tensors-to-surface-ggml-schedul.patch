@@ -1,0 +1,114 @@
+From 3754721c21e3121fc16f43f57cf811541f038f49 Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 17:43:52 -0400
+Subject: [PATCH] diag(mtp): name mask tensors to surface ggml scheduler state
+ bug
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When llama_mtp_draft is called between main decodes, the second main decode
+fails at sched_split_graph with:
+
+  pre-allocated tensor ( (copy)) in a buffer (MTL0) that cannot run the
+  operation (CPY)
+
+Root cause chain:
+
+1. build_attn_inp_no_cache (used by MTP) and build_attn_inp_kv_impl (used
+   by main decode) both create their kq_mask_cnv via ggml_cast on an
+   unnamed source tensor. ggml_cast formats the result as "%s (copy)"; with
+   an empty source name the result is literally " (copy)" (leading space).
+
+2. Naming both source and cnv tensors with stable names ("nc_kq_mask",
+   "nc_kq_mask_cnv" for no-cache; "kv_kq_mask", "kv_kq_mask_cnv" for kv)
+   made the crash message point at `kv_kq_mask_cnv` — the main decode's
+   mask cast — confirming that's where the scheduler fails.
+
+3. The tensor is pre-allocated in an MTL0 buffer before sched_split_graph
+   runs. That only happens if either (a) the tensor has a leftover buffer
+   from a prior graph's sched_alloc, or (b) it inherits one via
+   view_src. Neither should happen for a fresh graph node built in a
+   reset ctx_compute.
+
+4. The hypothesis is that ggml_backend_sched_reset does not fully clean up
+   prev_node_backend_ids / gallocr state across two graphs built in
+   *different* llm_graph_result instances (gf_res_mtp vs gf_res_prev) that
+   share the same sched. The first main decode after an MTP compute
+   inherits stale state that binds the cnv tensor to an MTL0 buffer whose
+   backend can't run the CPY op.
+
+This commit does not fix the scheduler bug. It adds explicit names so
+future debugging can trace the exact tensor involved. The mask tensor
+names are now visible in any assert or log involving the sched.
+
+Also named the MTP path's no-cache mask in qwen35.cpp for consistency and
+to eliminate the " (copy)" ambiguity that previously hid the root cause.
+
+Known remaining issue: llama_mtp_draft + subsequent main decode crashes.
+Documented in MTP_TODO_LATER.md.
+---
+ src/llama-graph.cpp   | 6 ++++++
+ src/models/qwen35.cpp | 9 +++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0437f647f..148415a07 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1842,15 +1842,19 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
+ 
+     // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
+     inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens, 1, 1);
++    ggml_set_name(inp->self_kq_mask, "nc_kq_mask");
+     ggml_set_input(inp->self_kq_mask);
+ 
+     inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
++    ggml_set_name(inp->self_kq_mask_cnv, "nc_kq_mask_cnv");
+ 
+     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+         inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_tokens, n_tokens, 1, 1);
++        ggml_set_name(inp->self_kq_mask_swa, "nc_kq_mask_swa");
+         ggml_set_input(inp->self_kq_mask_swa);
+ 
+         inp->self_kq_mask_swa_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask_swa, GGML_TYPE_F16) : inp->self_kq_mask_swa;
++        ggml_set_name(inp->self_kq_mask_swa_cnv, "nc_kq_mask_swa_cnv");
+     } else {
+         inp->self_kq_mask_swa     = nullptr;
+         inp->self_kq_mask_swa_cnv = nullptr;
+@@ -1926,10 +1930,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+ 
+         inp->self_kq_mask = build_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++        ggml_set_name(inp->self_kq_mask, "kv_kq_mask");
+ 
+         ggml_set_input(inp->self_kq_mask);
+ 
+         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
++        ggml_set_name(inp->self_kq_mask_cnv, "kv_kq_mask_cnv");
+     }
+ 
+     return inp;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 11657b36c..2df92a36d 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -34,6 +34,15 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
+         // attention input so build_attn() can handle GQA, softmax, scaling
+         // and masking internally against the single seed token.
+         auto * inp_attn_nc = build_attn_inp_no_cache();
++        // Rename the cast mask tensor so it doesn't collide with the main
++        // forward pass's identically-unnamed "(copy)" mask. Without this,
++        // the backend scheduler conflates the two across graph rebuilds and
++        // aborts on the second main decode with:
++        //   pre-allocated tensor ( (copy)) in a buffer (MTL0) that cannot
++        //   run the operation (CPY)
++        if (inp_attn_nc->get_kq_mask() != nullptr) {
++            ggml_set_name(inp_attn_nc->get_kq_mask(), "mtp_kq_mask_cnv");
++        }
+ 
+         const int il_mtp = (int) (n_layer - hparams.nextn_predict_layers);
+ 
+-- 
+2.51.2
+

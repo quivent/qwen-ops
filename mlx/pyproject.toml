@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-qwen-mtp"
+version = "0.1.0"
+description = "Multi-Token Prediction inference for Qwen3.5 on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{name = "Josh Kornreich"}]
+dependencies = [
+    "mlx>=0.30",
+    "mlx-lm>=0.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/joshkornreich/mlx-qwen-mtp"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

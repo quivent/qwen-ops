@@ -1,0 +1,28 @@
+--- /home/ubuntu/.local/lib/python3.10/site-packages/vllm/v1/worker/gpu_model_runner.py.bak2	2026-04-11 09:58:56.464979244 +0000
++++ /home/ubuntu/.local/lib/python3.10/site-packages/vllm/v1/worker/gpu_model_runner.py	2026-04-11 10:21:29.623334623 +0000
+@@ -6397,6 +6397,25 @@
+                 )
+             logger.warning(msg)
+ 
++        # TREE_ATTN + spec-decode: PIECEWISE capture succeeds but replaying
++        # with tree-shaped attention metadata causes EngineCore crashes.
++        # Force NONE until the tree_attn backend supports PIECEWISE graphs.
++        if (
++            cudagraph_mode == CUDAGraphMode.PIECEWISE
++            and min_cg_support == AttentionCGSupport.NEVER
++            and self.speculative_config is not None
++            and self.uniform_decode_query_len > 1
++        ):
++            msg = (
++                f"PIECEWISE cudagraphs are not yet stable with "
++                f"{min_cg_backend_name} + speculative decoding; "
++                f"setting cudagraph_mode=NONE"
++            )
++            cudagraph_mode = self.compilation_config.cudagraph_mode = (
++                CUDAGraphMode.NONE
++            )
++            logger.warning(msg)
++
+         # double check that we can support full cudagraph if they are requested
+         # even after automatic downgrades
+         if (

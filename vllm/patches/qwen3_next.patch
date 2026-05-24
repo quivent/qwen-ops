@@ -1,0 +1,25 @@
+--- vllm/model_executor/models/qwen3_next.py	2026-04-02 23:48:32.000000000 +0000
++++ /home/ubuntu/.local/lib/python3.10/site-packages/vllm/model_executor/models/qwen3_next.py	2026-04-09 18:21:50.536276290 +0000
+@@ -413,11 +413,17 @@
+                 output=self_attention_output,
+             )
+         elif self.layer_type == "full_attention":
+-            self.self_attn(
+-                hidden_states=hidden_states,
+-                output=self_attention_output,
+-                positions=positions,
+-            )
++            # Draft mode: skip attention, pass through hidden states.
++            # The DeltaNet layers carry the recurrent context;
++            # attention layers are only needed for verification.
++            if getattr(self, '_skip_attention', False):
++                self_attention_output.copy_(hidden_states)
++            else:
++                self.self_attn(
++                    hidden_states=hidden_states,
++                    output=self_attention_output,
++                    positions=positions,
++                )
+         else:
+             raise ValueError("Invalid layer_type")
+         hidden_states = self_attention_output

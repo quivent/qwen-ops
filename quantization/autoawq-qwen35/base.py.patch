@@ -1,0 +1,12 @@
+--- a/awq/models/base.py
++++ b/awq/models/base.py
+@@ Add to TRANSFORMERS_AUTO_MAPPING_DICT (around line 91):
+     "qwen2_vl": "AutoModelForVision2Seq",
+     "qwen2_5_vl": "AutoModelForVision2Seq",
+     "qwen2_5_omni": "AutoModelForTextToWaveform",
++    "qwen3_5": "AutoModelForImageTextToText",
+ }
+
+@@ Add AutoModelForImageTextToText to use_cache exclusion (around line 386):
+-        if model_init_kwargs.get("use_cache") is None and not ((target_cls_name == "AutoModelForVision2Seq") or (target_cls_name == "AutoModelForTextToWaveform")):
++        if model_init_kwargs.get("use_cache") is None and not ((target_cls_name == "AutoModelForVision2Seq") or (target_cls_name == "AutoModelForTextToWaveform") or (target_cls_name == "AutoModelForImageTextToText")):

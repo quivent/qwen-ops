@@ -1,0 +1,470 @@
+From b4dd196fac99cc68f7f9eb5ae6ba986004828f1e Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 14:28:32 -0400
+Subject: [PATCH] feat(mtp): execute MTP draft graph for qwen3next via
+ LLM_GRAPH_TYPE_MTP
+
+Wires the last-mile dispatch path that turns llama_mtp_draft from a -4
+stub into a working K-step greedy drafter.
+
+* qwen3next constructor: when params.gtype == LLM_GRAPH_TYPE_MTP, build
+  the NextN head only (build_mtp_head) over a single-token ubatch with
+  prev_hidden supplied as a host-uploaded graph input. The standard
+  forward pass is skipped entirely so no main KV is touched.
+* llm_graph_context: track gtype so model builders can branch on it.
+* llm_graph_result: expose t_mtp_prev_hidden_in and t_mtp_pos_zero_in
+  so the dispatcher can upload them via ggml_backend_tensor_set after
+  graph allocation. Also fix the previously-uninitialized inp_pos_zero
+  in build_mtp_head.
+* llama_context::mtp_graph_compute: minimal dispatcher that builds the
+  MTP graph against a dedicated gf_res_mtp instance, runs set_inputs,
+  uploads prev_hidden and the RoPE pos-zero scalar, computes, and pulls
+  back vocab logits. Dedicated graph result keeps gf_res_prev clean for
+  the next main decode.
+* llama_mtp_draft: K-step loop with greedy argmax. Returns the number
+  of draft tokens produced (positive) on success; matches what
+  common_speculative_mtp expects. Header doc updated.
+
+Correctness trade-off (matches dense Qwen3.5 PR #20700 behavior): the
+chained draft steps re-use ctx->mtp_prev_hidden across all K iterations
+rather than reading the MTP layer's own pre-norm hidden back from the
+graph and feeding it forward. The seed token does advance to the
+just-sampled argmax each step. A follow-up can export the MTP head's
+out_hidden node and substitute it on each step.
+
+Build: cmake --build build -j8 succeeds (libllama + llama-mtp-speculative
++ all targets).
+---
+ include/llama.h          |   3 +-
+ src/llama-context.cpp    | 252 +++++++++++++++++++++++++++++++--------
+ src/llama-context.h      |   6 +
+ src/llama-graph.cpp      |   1 +
+ src/llama-graph.h        |   9 ++
+ src/models/qwen3next.cpp |  31 +++++
+ 6 files changed, 253 insertions(+), 49 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index 325c3926a..c35617e6a 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1101,7 +1101,8 @@ extern "C" {
+     //                 n_draft * n_vocab to receive the per-step logits
+     //                 (may be NULL)
+     //
+-    // Returns 0 on success, negative on failure:
++    // Returns the number of draft tokens produced (>= 1) on success, or
++    // negative on failure:
+     //   -1  model has no MTP head
+     //   -2  invalid arguments
+     //   -3  no hidden state available (llama_decode must run first)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 98685e21d..681e39bb8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -12,11 +12,13 @@
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ 
++#include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
++#include <vector>
+ 
+ //
+ // llama_context
+@@ -405,6 +407,7 @@ void llama_context::sched_reserve() {
+ 
+     gf_res_prev.reset(new llm_graph_result(max_nodes));
+     gf_res_reserve.reset(new llm_graph_result(max_nodes));
++    gf_res_mtp.reset(new llm_graph_result(max_nodes));
+ 
+     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+ 
+@@ -3533,58 +3536,170 @@ int32_t llama_decode(
+ //
+ // Multi-Token Prediction (MTP / NextN) draft
+ //
+-// This is a thin public-API entry point that validates inputs and delegates
+-// to the model's MTP head graph builder (see llm_build_qwen3next::build_mtp_head).
++// Builds a synthetic single-token ubatch, dispatches it through the qwen3next
++// MTP graph (LLM_GRAPH_TYPE_MTP), and reads back vocab logits. Repeated K
++// times to produce K draft tokens via greedy argmax. The graph builder lives
++// in src/models/qwen3next.cpp (build_mtp_head) and matches the MLX reference
++// MTPHead.__call__ in ~/mlx-fork/fused_gdn.py.
+ //
+-// The graph builder is in place and matches the MLX reference; what this
+-// stub currently does NOT do is run the builder K times through the scheduler
+-// and read back logits. That requires adding a new llm_graph_type for
+-// MTP-only forward passes plus a small allocator loop in llama_context.
+-// Until that lands, the entry point returns a diagnostic so downstream
+-// callers can detect whether MTP is available and fall back to stock decode.
+-//
+-// TODO(mtp): wire up through process_ubatch with LLM_GRAPH_TYPE_MTP.
+-//
+-// Status (Stage 3 partial):
+-//   * The graph builder llm_build_qwen3next::build_mtp_head() is implemented
+-//     and matches the MLX reference (see src/models/qwen3next.cpp).
+-//   * MTP weights load via the NextN tensor path in llama-model.cpp.
+-//   * The post-output-norm hidden state of the last decoded token is now
+-//     captured into ctx->mtp_prev_hidden after every successful main decode
+-//     (see the t_embd_for_mtp block above), so the input the MTP head needs
+-//     is available host-side and ready to be uploaded into a draft graph.
+-//   * LLM_GRAPH_TYPE_MTP has been added to llm_graph_type.
+-//
+-// What's still missing for end-to-end execution:
+-//   1. A constructor branch in llm_build_qwen3next::llm_build_qwen3next()
+-//      keyed on params.gtype == LLM_GRAPH_TYPE_MTP that, instead of building
+-//      the full forward pass, allocates two input tensors
+-//      (prev_hidden, tok_embed), copies ctx->mtp_prev_hidden and the
+-//      embedding row for `last_token` into them, calls build_mtp_head() once,
+-//      and writes the resulting logits into res->t_logits.
+-//   2. A small llama_context helper that builds an llm_graph_params with
+-//      gtype=LLM_GRAPH_TYPE_MTP and a synthetic 1-token ubatch, dispatches
+-//      it through ggml_backend_sched_graph_compute_async, and pulls the
+-//      logits back into a host buffer.
+-//   3. A K-step loop here that, after each step, argmax-samples a token,
+-//      writes it to out_tokens[i], optionally writes the full row into
+-//      out_logits, and substitutes the MTP layer's output hidden state
+-//      (returned via build_mtp_head's out_hidden) for prev_hidden on the
+-//      next iteration. This mirrors MTPDraftHead.draft() in the MLX
+-//      reference (~/mlx-fork/fused_gdn.py).
+-//
+-// Until (1) and (2) land, this entry point validates inputs, confirms the
+-// hidden-state cache is populated, and returns -4 ("graph compute path not
+-// yet wired") so callers cleanly fall back to plain autoregressive decode.
++// Correctness note: this implementation re-uses ctx->mtp_prev_hidden as the
++// previous-step hidden across all K draft steps rather than feeding the MTP
++// layer's own output hidden forward. This matches what dense Qwen 3.5 MTP
++// (PR #20700) does for chained drafting and is the conservative baseline; a
++// follow-up can read the MTP head's pre-norm hidden back from the graph and
++// substitute it for prev_hidden on the next iteration.
++
++int32_t llama_context::mtp_graph_compute(llama_token seed_token, float * out_logits, int64_t n_vocab) {
++    if (!gf_res_mtp) {
++        return -4;
++    }
++
++    // Build a one-token ubatch backed by stack-allocated arrays. Only the
++    // fields read by qwen3next's MTP path matter (token, n_tokens, output);
++    // the rest are zeroed for safety.
++    llama_token  tok          = seed_token;
++    llama_pos    pos          = 0;
++    int32_t      n_seq_id_arr = 1;
++    llama_seq_id seq_id_val   = 0;
++    llama_seq_id * seq_id_ptr = &seq_id_val;
++    llama_seq_id seq_id_unq   = 0;
++    int8_t       output_flag  = 1;
++
++    int32_t seq_idx_arr[LLAMA_MAX_SEQ];
++    for (int i = 0; i < LLAMA_MAX_SEQ; ++i) seq_idx_arr[i] = -1;
++    seq_idx_arr[0] = 0;
++
++    llama_ubatch ubatch = {};
++    ubatch.b_equal_seqs = 1;
++    ubatch.n_tokens     = 1;
++    ubatch.n_seq_tokens = 1;
++    ubatch.n_seqs       = 1;
++    ubatch.n_seqs_unq   = 1;
++    ubatch.n_pos        = 1;
++    ubatch.token        = &tok;
++    ubatch.embd         = nullptr;
++    ubatch.pos          = &pos;
++    ubatch.n_seq_id     = &n_seq_id_arr;
++    ubatch.seq_id       = &seq_id_ptr;
++    ubatch.seq_id_unq   = &seq_id_unq;
++    ubatch.seq_idx      = seq_idx_arr;
++    ubatch.output       = &output_flag;
++
++    // Snapshot/restore n_outputs since graph_params reads it via this->n_outputs.
++    const uint32_t saved_n_outputs = this->n_outputs;
++    this->n_outputs = 1;
++
++    auto * res = gf_res_mtp.get();
++    res->reset();
++
++    // Build params manually so we can target gf_res_mtp instead of gf_res_prev.
++    llm_graph_params gparams = {
++        /*.arch        =*/ model.arch,
++        /*.hparams     =*/ model.hparams,
++        /*.cparams     =*/ cparams,
++        /*.ubatch      =*/ ubatch,
++        /*.gtype       =*/ LLM_GRAPH_TYPE_MTP,
++        /*.sched       =*/ sched.get(),
++        /*.backend_cpu =*/ backend_cpu,
++        /*.cvec        =*/ cvec.get(),
++        /*.loras       =*/ loras.get(),
++        /*.mctx        =*/ nullptr,
++        /*.cross       =*/ &cross,
++        /*.samplers    =*/ {},
++        /*.n_outputs   =*/ 1,
++        /*.cb          =*/ graph_get_cb(),
++        /*.res         =*/ res,
++    };
++
++    ggml_backend_sched_reset(sched.get());
++
++    ggml_cgraph * gf = model.build_graph(gparams);
++    if (!gf) {
++        this->n_outputs = saved_n_outputs;
++        LLAMA_LOG_ERROR("%s: failed to build MTP graph\n", __func__);
++        return -4;
++    }
++
++    if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
++        this->n_outputs = saved_n_outputs;
++        LLAMA_LOG_ERROR("%s: failed to allocate MTP graph\n", __func__);
++        return -4;
++    }
++
++    // Set token-embedding input via the registered llm_graph_input_embd callback.
++    res->set_inputs(&ubatch);
++
++    // Upload prev_hidden host buffer into the MTP graph input tensor.
++    if (res->t_mtp_prev_hidden_in == nullptr) {
++        this->n_outputs = saved_n_outputs;
++        LLAMA_LOG_ERROR("%s: MTP graph did not register a prev_hidden input tensor\n", __func__);
++        return -4;
++    }
++    {
++        const size_t want_bytes = ggml_nbytes(res->t_mtp_prev_hidden_in);
++        const size_t have_bytes = mtp_prev_hidden.size() * sizeof(float);
++        if (have_bytes < want_bytes) {
++            this->n_outputs = saved_n_outputs;
++            LLAMA_LOG_ERROR("%s: MTP prev_hidden buffer too small: have %zu have_bytes vs want %zu\n",
++                    __func__, have_bytes, want_bytes);
++            return -4;
++        }
++        ggml_backend_tensor_set(res->t_mtp_prev_hidden_in, mtp_prev_hidden.data(), 0, want_bytes);
++    }
++
++    // Upload the RoPE position-zero input (a single int32 zero).
++    if (res->t_mtp_pos_zero_in != nullptr) {
++        const int32_t zero = 0;
++        ggml_backend_tensor_set(res->t_mtp_pos_zero_in, &zero, 0, sizeof(zero));
++    }
++
++    const auto status = graph_compute(gf, /*batched=*/false);
++    if (status != GGML_STATUS_SUCCESS) {
++        this->n_outputs = saved_n_outputs;
++        LLAMA_LOG_ERROR("%s: MTP graph compute failed, status = %d\n", __func__, status);
++        return -4;
++    }
++
++    // Pull logits back to host.
++    auto * t_logits = res->get_logits();
++    if (t_logits == nullptr) {
++        this->n_outputs = saved_n_outputs;
++        LLAMA_LOG_ERROR("%s: MTP graph produced no logits tensor\n", __func__);
++        return -4;
++    }
++
++    const int64_t produced_vocab = t_logits->ne[0];
++    if (produced_vocab != n_vocab) {
++        LLAMA_LOG_WARN("%s: MTP logits n_vocab mismatch (graph=%lld, expected=%lld)\n",
++                __func__, (long long) produced_vocab, (long long) n_vocab);
++    }
++    const int64_t copy_vocab = std::min<int64_t>(produced_vocab, n_vocab);
++
++    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++    if (backend_res == nullptr) {
++        this->n_outputs = saved_n_outputs;
++        LLAMA_LOG_ERROR("%s: MTP logits tensor has no backend\n", __func__);
++        return -4;
++    }
++    ggml_backend_tensor_get_async(backend_res, t_logits, out_logits, 0, copy_vocab * sizeof(float));
++    ggml_backend_sched_synchronize(sched.get());
++
++    this->n_outputs = saved_n_outputs;
++
++    // The next main decode will rebuild its own graph in gf_res_prev — our
++    // separate gf_res_mtp keeps state isolated. We still reset the scheduler
++    // so the next call to process_ubatch starts cleanly.
++    ggml_backend_sched_reset(sched.get());
++
++    return 0;
++}
++
+ int32_t llama_mtp_draft(
+         struct llama_context * ctx,
+                  llama_token   last_token,
+                      int32_t   n_draft,
+                  llama_token * out_tokens,
+                        float * out_logits) {
+-    GGML_UNUSED(last_token);
+-    GGML_UNUSED(out_logits);
+-
+     if (ctx == nullptr || out_tokens == nullptr || n_draft <= 0) {
+         return -2;
+     }
+@@ -3599,9 +3714,50 @@ int32_t llama_mtp_draft(
+         return -3;
+     }
+ 
+-    // Graph execution path not yet wired through the scheduler — see the
+-    // detailed checklist in the function header comment above.
+-    return -4;
++    const auto & model   = ctx->get_model();
++    const int64_t n_vocab = model.vocab.n_tokens();
++    if (n_vocab <= 0) {
++        return -2;
++    }
++
++    // Scratch buffer for one row of logits per draft step.
++    std::vector<float> scratch_logits((size_t) n_vocab);
++
++    llama_token seed = last_token;
++    int32_t produced = 0;
++
++    for (int32_t k = 0; k < n_draft; ++k) {
++        const int32_t rc = ctx->mtp_graph_compute(seed, scratch_logits.data(), n_vocab);
++        if (rc != 0) {
++            // Bail out — return what we have so far if anything.
++            return produced > 0 ? produced : rc;
++        }
++
++        // Greedy argmax over the produced logits row.
++        int64_t      best_idx = 0;
++        float        best_val = scratch_logits[0];
++        for (int64_t v = 1; v < n_vocab; ++v) {
++            const float val = scratch_logits[v];
++            if (val > best_val) {
++                best_val = val;
++                best_idx = v;
++            }
++        }
++
++        out_tokens[k] = (llama_token) best_idx;
++        if (out_logits != nullptr) {
++            std::memcpy(out_logits + (size_t) k * (size_t) n_vocab,
++                        scratch_logits.data(),
++                        (size_t) n_vocab * sizeof(float));
++        }
++
++        // Chain: next seed token is the just-sampled argmax. We intentionally
++        // do NOT mutate ctx->mtp_prev_hidden — see correctness note above.
++        seed = (llama_token) best_idx;
++        ++produced;
++    }
++
++    return produced;
+ }
+ 
+ //
+diff --git a/src/llama-context.h b/src/llama-context.h
+index e030e2b2f..c4782f7b0 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -244,6 +244,11 @@ public:
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
++    // Build and execute the MTP draft graph for a single seed token, writing
++    // n_vocab logits into out_logits. Uses the cached mtp_prev_hidden buffer
++    // as the previous-step hidden state. Does not touch the main KV cache.
++    int32_t mtp_graph_compute(llama_token seed_token, float * out_logits, int64_t n_vocab);
++
+ private:
+     llm_graph_params graph_params(
+                         llm_graph_result * res,
+@@ -360,6 +365,7 @@ private:
+ 
+     llm_graph_result_ptr gf_res_prev;
+     llm_graph_result_ptr gf_res_reserve;
++    llm_graph_result_ptr gf_res_mtp; // dedicated graph result for MTP draft dispatches
+ 
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index dc58c0826..0437f647f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -871,6 +871,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     n_ctx_orig       (cparams.n_ctx_orig_yarn),
+     pooling_type     (cparams.pooling_type),
+     rope_type        (hparams.rope_type),
++    gtype            (params.gtype),
+     sched            (params.sched),
+     backend_cpu      (params.backend_cpu),
+     cvec             (params.cvec),
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 6855a5cde..975e6ac3e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -666,6 +666,13 @@ public:
+     ggml_tensor * t_embd        = nullptr;
+     ggml_tensor * t_embd_pooled = nullptr;
+ 
++    // MTP draft graph inputs (only populated when gtype == LLM_GRAPH_TYPE_MTP).
++    // These are raw input tensors uploaded host-side by llama_context's MTP
++    // dispatch path before graph_compute, bypassing the normal llm_graph_input
++    // callback mechanism. See llama_context::mtp_graph_compute.
++    ggml_tensor * t_mtp_prev_hidden_in = nullptr; // [n_embd, 1] previous hidden state
++    ggml_tensor * t_mtp_pos_zero_in    = nullptr; // [1] I32 RoPE position (always 0)
++
+     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
+     std::map<llama_seq_id, ggml_tensor*> t_candidates;
+     std::map<llama_seq_id, ggml_tensor*> t_sampled;
+@@ -737,6 +744,8 @@ struct llm_graph_context {
+     const enum llama_pooling_type pooling_type;
+     const enum llama_rope_type    rope_type;
+ 
++    const llm_graph_type gtype;
++
+     ggml_backend_sched_t sched;
+ 
+     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index fdff2cf65..d34ba2ad4 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -7,6 +7,36 @@ llm_build_qwen3next::llm_build_qwen3next(const llama_model & model, const llm_gr
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
++    // MTP draft graph: skip the full forward pass and run only the NextN
++    // (MTP) head over a single seed token plus the previous hidden state.
++    // The host buffer behind `prev_hidden` is uploaded by
++    // llama_context::mtp_graph_compute via res->t_mtp_prev_hidden_in.
++    if (gtype == LLM_GRAPH_TYPE_MTP) {
++        GGML_ASSERT(hparams.nextn_predict_layers > 0 && "MTP graph requested but model has no NextN layers");
++        GGML_ASSERT(ubatch.n_tokens == 1 && "MTP graph expects a single seed token per dispatch");
++
++        // Token embedding for the seed token. The standard build_inp_embd
++        // path registers an llm_graph_input_embd whose set_input() copies
++        // the token id from the ubatch.
++        ggml_tensor * tok_embed = build_inp_embd(model.tok_embd);
++        cb(tok_embed, "mtp_tok_embed", -1);
++
++        // Previous hidden state input — host-uploaded by the dispatcher.
++        ggml_tensor * prev_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, 1);
++        ggml_set_input(prev_hidden);
++        res->t_mtp_prev_hidden_in = prev_hidden;
++        cb(prev_hidden, "mtp_prev_hidden", -1);
++
++        const int il_mtp = (int) (n_layer - hparams.nextn_predict_layers);
++
++        ggml_tensor * mtp_logits = build_mtp_head(prev_hidden, tok_embed, il_mtp, nullptr);
++        cb(mtp_logits, "result_output", -1);
++        res->t_logits = mtp_logits;
++
++        ggml_build_forward_expand(gf, mtp_logits);
++        return;
++    }
++
+     inpL = build_inp_embd(model.tok_embd);
+     cb(inpL, "model.embed_tokens", -1);
+ 
+@@ -564,6 +594,7 @@ ggml_tensor * llm_build_qwen3next::build_mtp_head(
+     // what the MLX reference does via offset=0 for a fresh draft step).
+     ggml_tensor * inp_pos_zero = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+     ggml_set_input(inp_pos_zero);
++    res->t_mtp_pos_zero_in = inp_pos_zero;
+ 
+     Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos_zero, nullptr,
+             n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+-- 
+2.51.2
+

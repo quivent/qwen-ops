@@ -1,0 +1,144 @@
+From 8ebc567d01655b4e11be9b89b30d4ecb65f77c08 Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 18:57:15 -0400
+Subject: [PATCH] feat(mtp): AR re-decode path for rollback + MTP_FORCE_AR
+ diagnostic
+
+Two refinements on top of v1 rollback:
+
+1. The rollback re-decode now commits [id_last, accepted_drafts, corr]
+   ONE TOKEN AT A TIME instead of as a single K-token batch. This keeps
+   every post-rollback token on the build_delta_net_autoregressive path
+   (n_seq_tokens == 1) instead of build_delta_net_chunking, matching the
+   numerics of plain greedy decoding.
+
+2. New MTP_FORCE_AR=1 env var disables the MTP draft path entirely,
+   turning llama-mtp-speculative into a plain greedy AR decoder. With
+   this flag, output is byte-identical to llama-simple on 2 prompts:
+
+   'The capital of France is' (n=64): diff clean, 18.3 tok/s vs
+     llama-simple 17.1 tok/s
+   'Once upon a time'          (n=64): diff clean, 18.2 tok/s vs
+     llama-simple 17.3 tok/s
+
+Documents the outstanding split-rec-v2 requirement: when MTP drafting
+IS enabled, the verify batch has n_tokens >= 2 which forces the
+chunking path, and the numerical divergence between chunking and AR
+compounds through every rejection. True byte-identity with speculation
+enabled needs the in-graph split-recurrence (Option C): split DeltaNet
+into N T=1 recurrence steps during verify while keeping input_proj /
+output_proj batched. That refactor is scoped in /tmp/mtp_split_rec_plan.md
+and remains TODO.
+---
+ examples/mtp-speculative/mtp-speculative.cpp | 74 ++++++++++++++------
+ 1 file changed, 51 insertions(+), 23 deletions(-)
+
+diff --git a/examples/mtp-speculative/mtp-speculative.cpp b/examples/mtp-speculative/mtp-speculative.cpp
+index 49934525d..2870c3c73 100644
+--- a/examples/mtp-speculative/mtp-speculative.cpp
++++ b/examples/mtp-speculative/mtp-speculative.cpp
+@@ -139,8 +139,29 @@ int main(int argc, char ** argv) {
+     const int64_t t_dec_start = ggml_time_us();
+ 
+     while ((int) generated.size() < n_predict) {
+-        // Step 1: draft K tokens from the MTP head on the target.
+-        llama_tokens drafts = common_speculative_mtp_draft(spec, id_last, n_draft_max);
++        // MTP_FORCE_AR=1 disables MTP drafting entirely and runs the plain
++        // greedy-AR path through this binary. This is the known byte-identity
++        // baseline vs `llama-simple -n N`: when enabled, the only difference
++        // between this binary and the reference AR decoder is the snapshot
++        // rollback bookkeeping, which becomes a no-op (draft path is skipped).
++        //
++        // TODO(split-rec-v2): When MTP drafting is ENABLED and any draft
++        // tokens are produced, the verify batch has n_tokens >= 2 which
++        // routes the DeltaNet layer through build_delta_net_chunking instead
++        // of build_delta_net_autoregressive. The two paths are mathematically
++        // equivalent but numerically diverge in fp16/fp32, so the target
++        // logits at verify positions differ from what llama-simple sees at
++        // the same positions — and the divergence compounds every rejection.
++        //
++        // Achieving byte-identity with llama-simple while still running
++        // speculation requires the v2 in-graph split-recurrence (Option C in
++        // /tmp/mtp_split_rec_plan.md): split the DeltaNet recurrence into N
++        // sequential T=1 steps during verify so the recurrent numerics match
++        // the AR path, while still batching the input_proj / output_proj
++        // at T=N. That's a qwen35.cpp / delta-net-base.cpp refactor pending.
++        llama_tokens drafts = (getenv("MTP_FORCE_AR") != nullptr)
++                                  ? llama_tokens{}
++                                  : common_speculative_mtp_draft(spec, id_last, n_draft_max);
+ 
+         if (drafts.empty()) {
+             // No MTP heads available (or draft head returned nothing).
+@@ -291,27 +312,20 @@ int main(int argc, char ** argv) {
+                 }
+             }
+ 
+-            // Re-decode: id_last + n_accepted drafts + correction.
++            // Re-decode commit path: walk the committed tokens one at a
++            // time so each goes through build_delta_net_autoregressive (the
++            // n_seq_tokens==1 branch in qwen35.cpp build_layer_attn_linear).
++            // This matches the numerical path used by plain greedy decoding
++            // and avoids the chunking-vs-AR divergence that would otherwise
++            // accumulate on every rollback.
+             const int32_t n_commit = 1 + n_accepted + 1; // id_last, drafts[0..n_accepted-1], corr
+-            verify_batch.n_tokens     = n_commit;
+-            verify_batch.token[0]     = id_last;
+-            verify_batch.pos[0]       = n_past;
+-            verify_batch.n_seq_id[0]  = 1;
+-            verify_batch.seq_id[0][0] = 0;
+-            verify_batch.logits[0]    = 0;
++            std::vector<llama_token> commit_toks;
++            commit_toks.reserve(n_commit);
++            commit_toks.push_back(id_last);
+             for (int32_t i = 0; i < n_accepted; ++i) {
+-                verify_batch.token[1 + i]     = drafts[i];
+-                verify_batch.pos[1 + i]       = n_past + 1 + i;
+-                verify_batch.n_seq_id[1 + i]  = 1;
+-                verify_batch.seq_id[1 + i][0] = 0;
+-                verify_batch.logits[1 + i]    = 0;
++                commit_toks.push_back(drafts[i]);
+             }
+-            const int32_t corr_slot = 1 + n_accepted;
+-            verify_batch.token[corr_slot]     = corr;
+-            verify_batch.pos[corr_slot]       = n_past + 1 + n_accepted;
+-            verify_batch.n_seq_id[corr_slot]  = 1;
+-            verify_batch.seq_id[corr_slot][0] = 0;
+-            verify_batch.logits[corr_slot]    = 1; // need logits at the correction slot for next round's draft seed
++            commit_toks.push_back(corr);
+ 
+             if (snap == nullptr) {
+                 // No rollback available: fall back to the legacy no-trim path
+@@ -331,13 +345,27 @@ int main(int argc, char ** argv) {
+                 n_past  = n_past + 1 + n_drafted + 1;
+                 id_last = corr;
+             } else {
+-                if (llama_decode(ctx_tgt, verify_batch) != 0) {
+-                    LOG_ERR("%s: rollback re-decode failed\n", __func__);
++                bool rollback_ok = true;
++                for (int32_t i = 0; i < n_commit; ++i) {
++                    verify_batch.n_tokens     = 1;
++                    verify_batch.token[0]     = commit_toks[i];
++                    verify_batch.pos[0]       = n_past + i;
++                    verify_batch.n_seq_id[0]  = 1;
++                    verify_batch.seq_id[0][0] = 0;
++                    verify_batch.logits[0]    = (i == n_commit - 1) ? 1 : 0;
++                    if (llama_decode(ctx_tgt, verify_batch) != 0) {
++                        LOG_ERR("%s: rollback re-decode step %d/%d failed\n",
++                                __func__, i, n_commit);
++                        rollback_ok = false;
++                        break;
++                    }
++                    common_speculative_mtp_note_forward_pass(spec);
++                }
++                if (!rollback_ok) {
+                     llama_memory_release_snapshot(snap);
+                     snap = nullptr;
+                     break;
+                 }
+-                common_speculative_mtp_note_forward_pass(spec);
+                 n_past  += n_commit;
+                 id_last = corr;
+             }
+-- 
+2.51.2
+

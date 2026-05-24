@@ -1,0 +1,506 @@
+From 53075d24cc96fbfe629c6376e55dd81c57641f53 Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 17:16:00 -0400
+Subject: [PATCH] fix(mtp): end-to-end MTP head load+execute for qwen35 dense
+ Qwen3.5-27B
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Addresses the infrastructure gaps that prevented a converted Qwen3.5-27B
+(with mtp_num_hidden_layers: 1) from loading and running the MTP draft path.
+Every fix in this commit is backed by either a runtime error, a tensor-shape
+diff against the working main forward path, or a cross-reference with another
+arch that has the correct pattern.
+
+Fix 1 — gguf-py/gguf/constants.py QWEN35 tensor list
+  Add FFN_NORM + 6 NEXTN_* entries so the converter's tensor_map accepts the
+  remapped MTP tensor names. Strictly additive; no other arch touched.
+
+Fix 2 — convert_hf_to_gguf.py Qwen3NextModel.__init__
+  Override __init__ to bump self.block_count by hparams.mtp_num_hidden_layers
+  after super().__init__, then rebuild self.tensor_map so the MTP layer at
+  index 64 is in range. Gated on n_mtp > 0 so the 80B-A3B MoE path is
+  unaffected. Propagates via _LinearAttentionVReorderBase to Qwen3_5TextModel.
+
+Fix 3 — src/llama-model.cpp QWEN35 hparams + loader
+  * Read LLM_KV_NEXTN_PREDICT_LAYERS in load_hparams (optional).
+  * Fix the recurrent_layer_arr loop so the MTP layer at index n_base is
+    never marked recurrent — MTP is always dense full-attention.
+  * Extend the type switch to map (n_layer - nextn_predict_layers) == 64 to
+    LLM_TYPE_27B.
+  * Add a layer.nextn.* allocation block (eh_proj, enorm, hnorm,
+    shared_head_norm required; embed_tokens, shared_head_head optional for
+    mtp_use_dedicated_embeddings: False).
+  * Replace LLM_TENSOR_ATTN_POST_NORM with LLM_TENSOR_FFN_NORM in the
+    attn_post_norm create_tensor call: HF post_attention_layernorm is emitted
+    as blk.N.ffn_norm.weight by the Llama-family tensor_mapping, and the
+    graph builder uses layer.attn_post_norm as the pre-FFN norm. Pre-existing
+    upstream bug — the QWEN35 loader had never been exercised against a real
+    converted GGUF. Same fix applied to QWEN35MOE.
+
+Fix 4 — src/llama-arch.cpp QWEN35 tensor registration
+  * Replace ATTN_POST_NORM with FFN_NORM in the LLM_TENSOR_NAMES list so tn()
+    resolves correctly.
+  * Add all six NEXTN_* entries so tn() can substitute blk.%d.* for them.
+  * Reclassify NEXTN_* entries from LLM_TENSOR_LAYER_OUTPUT to
+    LLM_TENSOR_LAYER_REPEATING: the name template is blk.%d.nextn.* so they
+    are per-layer, not global output tensors. Pre-existing upstream bug —
+    prior arches only loaded these as TENSOR_NOT_REQUIRED so they escaped
+    the layer-index sanity check in create_tensor.
+
+Fix 5 — src/models/qwen35.cpp build_mtp_head
+  Rewrite the attention block to mirror the working main path:
+  * Use build_attn_inp_no_cache() + build_attn() instead of manual K*Q + softmax
+    + scale + ggml_repeat_4d. The manual version had two shape bugs — an
+    unnecessary 4D reshape of Qcur_full, and an incorrect ggml_repeat_4d call
+    that tried to insert a broadcast axis via repeat (which broadcasts, it
+    does not insert).
+  * Use 3D views of Qcur_full for Qcur and gate, matching the main path.
+  * Switch RoPE from ggml_rope_ext to ggml_rope_multi with hparams.rope_sections,
+    matching the main path's MRoPE call. Allocate inp_pos_zero as length 4
+    (one position per rope section) instead of length 1.
+  * Fall back to model.output (or model.tok_embd if tied) when
+    layer.nextn.shared_head_head is null — required for
+    mtp_use_dedicated_embeddings: False models like Qwen3.5-27B.
+
+Fix 6 — src/llama-context.cpp mtp_graph_compute
+  Upload the full inp_pos_zero tensor contents (size-agnostic zero fill)
+  instead of a single int32 — the MTP head now allocates inp_pos_zero as
+  length 4 for MRoPE.
+
+Known remaining issue: spec decode rollback path hits backend scheduling
+errors around recurrent memory position management (find_slot: non-consecutive
+token position) during the verify phase. MTP head itself runs end-to-end and
+produces plausible drafts. Separate subsystem.
+---
+ convert_hf_to_gguf.py     |  27 +++++++++-
+ gguf-py/gguf/constants.py |   9 +++-
+ src/llama-arch.cpp        |  23 ++++++---
+ src/llama-context.cpp     |  10 ++--
+ src/llama-model.cpp       |  43 +++++++++++++---
+ src/models/models.h       |   1 +
+ src/models/qwen35.cpp     | 105 ++++++++++++++++++++++++--------------
+ 7 files changed, 159 insertions(+), 59 deletions(-)
+
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index e03810959..70242a0df 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -4451,6 +4451,17 @@ class Qwen3MoeModel(Qwen2MoeModel):
+ class Qwen3NextModel(Qwen2MoeModel):
+     model_arch = gguf.MODEL_ARCH.QWEN3NEXT
+ 
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Extend block_count by the number of MTP predict layers so the tensor_map
++        # has slots for the trailing MTP block (blk.<n_base>.* / blk.<n_base>.nextn.*).
++        # Without this, remapped mtp.* tensors target a bid that is out of range and
++        # get_tensor_name_map rejects them. Rebuild tensor_map after the bump.
++        n_mtp = int(self.hparams.get("mtp_num_hidden_layers", 0) or 0)
++        if n_mtp > 0:
++            self.block_count += n_mtp
++            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
++
+     def set_gguf_parameters(self):
+         super().set_gguf_parameters()
+         self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
+@@ -4459,13 +4470,25 @@ class Qwen3NextModel(Qwen2MoeModel):
+         self.gguf_writer.add_ssm_time_step_rank(self.hparams["linear_num_value_heads"])
+         self.gguf_writer.add_ssm_inner_size(self.hparams["linear_value_head_dim"] * self.hparams["linear_num_value_heads"])
+         self.gguf_writer.add_full_attention_interval(self.hparams.get("full_attention_interval", 4))
++        self.gguf_writer.add_nextn_predict_layers(1)
+         if (rope_dim := self.hparams.get("head_dim")) is None:
+             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
+         self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.hparams.get("partial_rotary_factor", 0.25)))
+ 
+     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+-        if name.startswith("mtp"):
+-            return  # ignore MTP layers for now
++        if name.startswith("mtp."):
++            n_base = self.hparams["num_hidden_layers"]
++            if ".layers." in name:
++                name = name.replace("mtp.layers.0", f"model.layers.{n_base}")
++            else:
++                remapper = {
++                    "mtp.fc":                    f"model.layers.{n_base}.eh_proj",
++                    "mtp.pre_fc_norm_embedding": f"model.layers.{n_base}.enorm",
++                    "mtp.pre_fc_norm_hidden":    f"model.layers.{n_base}.hnorm",
++                    "mtp.norm":                  f"model.layers.{n_base}.shared_head.norm",
++                }
++                stem, _, ext = name.rpartition(".")
++                name = remapper[stem] + "." + ext
+         if name.endswith(".A_log"):
+             data_torch = -torch.exp(data_torch)
+         elif name.endswith(".dt_bias"):
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 689acdc65..9ec39717c 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -1861,6 +1861,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.ATTN_POST_NORM,
+         MODEL_TENSOR.ATTN_GATE,
+         MODEL_TENSOR.ATTN_QKV,
++        MODEL_TENSOR.FFN_NORM,
+         MODEL_TENSOR.FFN_GATE,
+         MODEL_TENSOR.FFN_DOWN,
+         MODEL_TENSOR.FFN_UP,
+@@ -1870,7 +1871,13 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.SSM_NORM,
+         MODEL_TENSOR.SSM_BETA,
+         MODEL_TENSOR.SSM_ALPHA,
+-        MODEL_TENSOR.SSM_OUT
++        MODEL_TENSOR.SSM_OUT,
++        MODEL_TENSOR.NEXTN_EH_PROJ,
++        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
++        MODEL_TENSOR.NEXTN_ENORM,
++        MODEL_TENSOR.NEXTN_HNORM,
++        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
++        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+     ],
+     MODEL_ARCH.QWEN35MOE: [
+         MODEL_TENSOR.TOKEN_EMBD,
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index b2e3e4302..8f0b86eea 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -1013,7 +1013,7 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
+                 LLM_TENSOR_OUTPUT_NORM,
+                 LLM_TENSOR_OUTPUT,
+                 LLM_TENSOR_ATTN_NORM,
+-                LLM_TENSOR_ATTN_POST_NORM,
++                LLM_TENSOR_FFN_NORM,
+                 LLM_TENSOR_ATTN_Q,
+                 LLM_TENSOR_ATTN_Q_NORM,
+                 LLM_TENSOR_ATTN_K,
+@@ -1032,6 +1032,12 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
+                 LLM_TENSOR_SSM_ALPHA,
+                 LLM_TENSOR_SSM_NORM,
+                 LLM_TENSOR_SSM_OUT,
++                LLM_TENSOR_NEXTN_EH_PROJ,
++                LLM_TENSOR_NEXTN_EMBED_TOKENS,
++                LLM_TENSOR_NEXTN_ENORM,
++                LLM_TENSOR_NEXTN_HNORM,
++                LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
++                LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+             };
+         case LLM_ARCH_QWEN35MOE:
+             return {
+@@ -2729,12 +2735,15 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_INDEXER_ATTN_Q_B,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     // NextN/MTP tensors are currently ignored (reserved for future MTP support)
+     // These tensors only exist in the last layer(s) and are treated as output tensors
+-    {LLM_TENSOR_NEXTN_EH_PROJ,              {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+-    {LLM_TENSOR_NEXTN_EMBED_TOKENS,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_GET_ROWS}},
+-    {LLM_TENSOR_NEXTN_ENORM,                {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_GET_ROWS}},
+-    {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
+-    {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
+-    {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
++    // NextN/MTP tensors live under `blk.<i>.nextn.*` in the GGUF — they are per-layer,
++    // not global output-layer tensors. Classify them as LAYER_REPEATING so the loader
++    // sanity check at llama-model.cpp::create_tensor accepts a layer index.
++    {LLM_TENSOR_NEXTN_EH_PROJ,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_NEXTN_EMBED_TOKENS,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_NEXTN_ENORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+ };
+ 
+ LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 681e39bb8..f11ca26bf 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3647,10 +3647,14 @@ int32_t llama_context::mtp_graph_compute(llama_token seed_token, float * out_log
+         ggml_backend_tensor_set(res->t_mtp_prev_hidden_in, mtp_prev_hidden.data(), 0, want_bytes);
+     }
+ 
+-    // Upload the RoPE position-zero input (a single int32 zero).
++    // Upload the RoPE position-zero input. MRoPE (Qwen3.5) expects 4 int32s
++    // per token (one per rope section). We allocated the tensor as length 4
++    // in build_mtp_head; size-agnostic zero fill covers both that layout and
++    // the legacy single-element layout used by other MTP builders.
+     if (res->t_mtp_pos_zero_in != nullptr) {
+-        const int32_t zero = 0;
+-        ggml_backend_tensor_set(res->t_mtp_pos_zero_in, &zero, 0, sizeof(zero));
++        const size_t zbytes = ggml_nbytes(res->t_mtp_pos_zero_in);
++        std::vector<int32_t> zeros(zbytes / sizeof(int32_t), 0);
++        ggml_backend_tensor_set(res->t_mtp_pos_zero_in, zeros.data(), 0, zbytes);
+     }
+ 
+     const auto status = graph_compute(gf, /*batched=*/false);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index bbe61cd82..3a94764ed 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2506,17 +2506,25 @@ void llama_model::load_hparams(llama_model_loader & ml) {
+                 ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+                 ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+ 
+-                // Mark recurrent layers (linear attention layers)
++                // NextN/MTP parameters (optional; present in Qwen3.5-27B MTP variants)
++                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
++
++                // Mark recurrent layers (linear attention layers).
++                // Only the base (non-MTP) layers follow the full_attention_interval pattern.
++                // MTP predict layers at the end are always dense full-attention.
+                 {
+                     uint32_t full_attn_interval = 4;
+                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
++                    const uint32_t n_base = hparams.n_layer - hparams.nextn_predict_layers;
+                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+-                        hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
++                        hparams.recurrent_layer_arr[i] =
++                            (i < n_base) && (((i + 1) % full_attn_interval) != 0);
+                     }
+                 }
+ 
+-                switch (hparams.n_layer) {
++                switch (hparams.n_layer - hparams.nextn_predict_layers) {
+                     case 24: type = LLM_TYPE_2B; break;
++                    case 64: type = LLM_TYPE_27B; break;
+                     default: type = LLM_TYPE_UNKNOWN;
+                 }
+             } break;
+@@ -7438,8 +7446,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                     for (int i = 0; i < n_layer; ++i) {
+                         auto & layer = layers[i];
+ 
+-                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
+-                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
++                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
++                        // Qwen3.5's HF `post_attention_layernorm` is emitted by convert_hf_to_gguf.py as
++                        // `blk.<i>.ffn_norm.weight` per standard Llama-family naming. Load it here into
++                        // the `attn_post_norm` field so the existing graph builder reads work unchanged.
++                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
+ 
+                         if (!hparams.is_recurrent(i)) {
+                             // Attention layers
+@@ -7504,8 +7515,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                     for (int i = 0; i < n_layer; ++i) {
+                         auto & layer = layers[i];
+ 
+-                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), { n_embd }, 0);
+-                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
++                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
++                        // Qwen3.5's HF `post_attention_layernorm` is emitted by convert_hf_to_gguf.py as
++                        // `blk.<i>.ffn_norm.weight` per standard Llama-family naming. Load it here into
++                        // the `attn_post_norm` field so the existing graph builder reads work unchanged.
++                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
+ 
+                         if (!hparams.is_recurrent(i)) {
+                             // Attention layers
+@@ -7534,6 +7548,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+                         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
++
++                        // NextN/MTP tensors — loaded only for the trailing MTP predict layers.
++                        // Qwen3.5-27B stores 4 nextn-specific tensors: eh_proj (embed/hidden projection),
++                        // enorm (pre-fc norm on the embed half), hnorm (pre-fc norm on the hidden half),
++                        // and shared_head_norm (final norm before the shared lm_head).
++                        // embed_tokens and shared_head_head are shared with the main model (not emitted
++                        // by the converter) and left TENSOR_NOT_REQUIRED.
++                        if (hparams.nextn_predict_layers > 0 && static_cast<uint32_t>(i) >= n_layer - hparams.nextn_predict_layers) {
++                            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), { 2 * n_embd, n_embd }, 0);
++                            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), { n_embd }, 0);
++                            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), { n_embd }, 0);
++                            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd }, 0);
++                            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", i), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
++                            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
++                        }
+                     }
+                 } break;
+             case LLM_ARCH_MIMO2:
+diff --git a/src/models/models.h b/src/models/models.h
+index e50f87e54..4a2291261 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -573,6 +573,7 @@ struct llm_build_qwen35 : public llm_build_delta_net_base {
+     // (dense ffn_gate/ffn_up/ffn_down) and attention layout.
+     // TODO(dedupe): share with llm_build_qwen3next::build_mtp_head.
+     ggml_tensor * build_mtp_head(
++                llm_graph_input_attn_no_cache * inp_attn_nc,
+                 ggml_tensor *  prev_hidden,
+                 ggml_tensor *  tok_embed,
+                           int  il_mtp,
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index ef324aef0..11657b36c 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -30,9 +30,14 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
+         res->t_mtp_prev_hidden_in = prev_hidden;
+         cb(prev_hidden, "mtp_prev_hidden", -1);
+ 
++        // MTP runs without a KV cache (mctx == nullptr). Use the no-cache
++        // attention input so build_attn() can handle GQA, softmax, scaling
++        // and masking internally against the single seed token.
++        auto * inp_attn_nc = build_attn_inp_no_cache();
++
+         const int il_mtp = (int) (n_layer - hparams.nextn_predict_layers);
+ 
+-        ggml_tensor * mtp_logits = build_mtp_head(prev_hidden, tok_embed, il_mtp, nullptr);
++        ggml_tensor * mtp_logits = build_mtp_head(inp_attn_nc, prev_hidden, tok_embed, il_mtp, nullptr);
+         cb(mtp_logits, "result_output", -1);
+         res->t_logits = mtp_logits;
+ 
+@@ -396,6 +401,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
+ }
+ 
+ ggml_tensor * llm_build_qwen35::build_mtp_head(
++        llm_graph_input_attn_no_cache * inp_attn_nc,
+         ggml_tensor *  prev_hidden,
+         ggml_tensor *  tok_embed,
+                   int  il_mtp,
+@@ -414,7 +420,13 @@ ggml_tensor * llm_build_qwen35::build_mtp_head(
+     GGML_ASSERT(layer.nextn.hnorm            && "MTP hnorm missing");
+     GGML_ASSERT(layer.nextn.eh_proj          && "MTP eh_proj missing");
+     GGML_ASSERT(layer.nextn.shared_head_norm && "MTP shared_head_norm missing");
+-    GGML_ASSERT(layer.nextn.shared_head_head && "MTP shared_head_head missing");
++    // shared_head_head is OPTIONAL — when `mtp_use_dedicated_embeddings: False`
++    // (e.g. Qwen3.5-27B), the MTP head reuses the main model's output projection.
++    // Fall back to `model.output` (or `model.tok_embd` if output was tied to embed).
++    ggml_tensor * mtp_head_w = layer.nextn.shared_head_head
++                                 ? layer.nextn.shared_head_head
++                                 : (model.output ? model.output : model.tok_embd);
++    GGML_ASSERT(mtp_head_w && "MTP head projection unavailable (no shared_head_head, no model.output, no tok_embd)");
+ 
+     const int64_t n_embd_head = hparams.n_embd_head_v;
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+@@ -434,72 +446,87 @@ ggml_tensor * llm_build_qwen35::build_mtp_head(
+     ggml_tensor * h = build_lora_mm(layer.nextn.eh_proj, concat);
+     cb(h, "mtp_fc_out", il_mtp);
+ 
+-    // --- 2. Gated self-attention (single token, no past cache, no mask) ---
++    // --- 2. Gated self-attention (single token, no KV cache) ---
++    // Mirrors llm_build_qwen35::build_layer_attn (the main forward path) but
++    // uses build_attn_inp_no_cache instead of the KV-cache inp, since the MTP
++    // draft runs with mctx == nullptr.
+     ggml_tensor * residual = h;
+     ggml_tensor * h_attn = build_norm(h, layer.attn_norm, nullptr, LLM_NORM_RMS, il_mtp);
+     cb(h_attn, "mtp_attn_norm", il_mtp);
+ 
+-    // Q projection produces [Q | gate] interleaved per-head
++    // wq output is [ (head_dim * 2) * n_head, 1 ] — the "* 2" splits into Q and gate.
+     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, h_attn);
+     cb(Qcur_full, "mtp_Qcur_full", il_mtp);
+ 
+-    Qcur_full = ggml_reshape_4d(ctx0, Qcur_full, n_embd_head * 2, n_head, 1, 1);
++    // 3D view: first head_dim slice of each head's 2*head_dim chunk is Q.
++    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, 1,
++        ggml_element_size(Qcur_full) * n_embd_head * 2,
++        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
++    cb(Qcur, "mtp_Qcur_reshaped", il_mtp);
+ 
+-    ggml_tensor * Qcur = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, 1, 1,
+-                                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], 0);
+-    ggml_tensor * gate = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, 1, 1,
+-                                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3],
+-                                      n_embd_head * ggml_element_size(Qcur_full));
++    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(Qcur, "mtp_Qcur_normed", il_mtp);
+ 
+     ggml_tensor * Kcur = build_lora_mm(layer.wk, h_attn);
++    cb(Kcur, "mtp_Kcur_raw", il_mtp);
++
+     ggml_tensor * Vcur = build_lora_mm(layer.wv, h_attn);
++    cb(Vcur, "mtp_Vcur_raw", il_mtp);
+ 
+     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, 1);
+-    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, 1);
+-
+-    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il_mtp);
+     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(Kcur, "mtp_Kcur_normed", il_mtp);
++
++    // Gate: second head_dim slice of each head's 2*head_dim chunk.
++    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, 1,
++        ggml_element_size(Qcur_full) * n_embd_head * 2,
++        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
++        ggml_element_size(Qcur_full) * n_embd_head);
++    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, 1);
++    cb(gate, "mtp_gate_reshaped", il_mtp);
++
++    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, 1);
+ 
+-    // RoPE at position 0. At pos=0, RoPE is identity so MRoPE sections do
+-    // not matter here — use the simpler ggml_rope_ext path.
+-    ggml_tensor * inp_pos_zero = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++    // MRoPE at position 0. Qwen3.5 uses multi-section rope; positions tensor
++    // must be length 4 * n_tokens (one per rope section). For a 1-token MTP
++    // dispatch, that's 4 int32s all zero, uploaded by mtp_graph_compute.
++    ggml_tensor * inp_pos_zero = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4);
+     ggml_set_input(inp_pos_zero);
+     res->t_mtp_pos_zero_in = inp_pos_zero;
+ 
+-    Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos_zero, nullptr,
+-            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++    int mtp_sections[4];
++    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, mtp_sections);
++
++    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos_zero, nullptr,
++            n_rot, mtp_sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+             ext_factor, attn_factor, beta_fast, beta_slow);
+-    Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos_zero, nullptr,
+-            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos_zero, nullptr,
++            n_rot, mtp_sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+             ext_factor, attn_factor, beta_fast, beta_slow);
+     cb(Qcur, "mtp_Qcur", il_mtp);
+     cb(Kcur, "mtp_Kcur", il_mtp);
+     cb(Vcur, "mtp_Vcur", il_mtp);
+ 
++    // Attention via the no-cache helper. This handles GQA repeat, softmax,
++    // masking, scaling internally and returns a [n_embd, 1] pre-output tensor.
++    // Pass nullptr for wo/wo_b so we can apply the gate BEFORE the output
++    // projection, matching the main path's order.
+     const float kq_scale = hparams.f_attention_scale == 0.0f
+         ? 1.0f / sqrtf(float(n_embd_head))
+         : hparams.f_attention_scale;
+ 
+-    if (n_head_kv != n_head) {
+-        GGML_ASSERT(n_head % n_head_kv == 0);
+-        const int64_t rep = n_head / n_head_kv;
+-        Kcur = ggml_repeat_4d(ctx0, Kcur, n_embd_head, rep, n_head_kv, 1);
+-        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head, 1);
+-        Vcur = ggml_repeat_4d(ctx0, Vcur, n_embd_head, rep, n_head_kv, 1);
+-        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head, 1);
+-    }
+-
+-    ggml_tensor * KQ = ggml_mul_mat(ctx0, Kcur, Qcur);
+-    KQ = ggml_scale(ctx0, KQ, kq_scale);
+-    KQ = ggml_soft_max(ctx0, KQ);
+-
+-    ggml_tensor * KQV = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Vcur)), KQ);
+-    ggml_tensor * attn_out = ggml_reshape_2d(ctx0, KQV, n_embd_head * n_head, 1);
++    ggml_tensor * attn_out = build_attn(inp_attn_nc,
++            nullptr, nullptr,
++            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
++            kq_scale, il_mtp);
+     cb(attn_out, "mtp_attn_pregate", il_mtp);
+ 
+-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, 1);
+-    gate = ggml_sigmoid(ctx0, gate);
+-    attn_out = ggml_mul(ctx0, attn_out, gate);
++    // Gate: sigmoid(gate) * attn_out
++    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
++    cb(gate_sigmoid, "mtp_gate_sigmoid", il_mtp);
++
++    attn_out = ggml_mul(ctx0, attn_out, gate_sigmoid);
++    cb(attn_out, "mtp_attn_gated", il_mtp);
+ 
+     attn_out = build_lora_mm(layer.wo, attn_out);
+     cb(attn_out, "mtp_attn_out", il_mtp);
+@@ -531,7 +558,7 @@ ggml_tensor * llm_build_qwen35::build_mtp_head(
+     ggml_tensor * h_final = build_norm(h, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il_mtp);
+     cb(h_final, "mtp_final_norm", il_mtp);
+ 
+-    ggml_tensor * logits = build_lora_mm(layer.nextn.shared_head_head, h_final);
++    ggml_tensor * logits = build_lora_mm(mtp_head_w, h_final);
+     cb(logits, "mtp_logits", il_mtp);
+ 
+     return logits;
+-- 
+2.51.2
+

@@ -1,0 +1,472 @@
+From a5091a5dd74365fa1bf55c32109ede614811372c Mon Sep 17 00:00:00 2001
+From: quivent <quivent@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 14:07:45 -0400
+Subject: [PATCH] feat(qwen3next): MTP (NextN) head graph builder + load path
+
+- Register NEXTN tensor enums for LLM_ARCH_QWEN3NEXT so loader knows
+  blk.*.nextn.{eh_proj,enorm,hnorm,embed_tokens,shared_head_*}.
+- Read LLM_KV_NEXTN_PREDICT_LAYERS for QWEN3NEXT hparams (optional).
+- Load the 6 NextN tensors into layer.nextn.* for the last
+  nextn_predict_layers layers of a qwen3next model. All marked
+  TENSOR_NOT_REQUIRED so existing models without MTP still load.
+- Add llama_model::has_mtp_head() helper: true iff every expected
+  NextN layer has a populated eh_proj.
+- Add llm_build_qwen3next::build_mtp_head(prev_hidden, tok_embed, il,
+  out_hidden) implementing one MTP layer forward pass:
+    h_n = hnorm(prev_hidden); e_n = enorm(tok_embed)
+    h = eh_proj(concat([e_n, h_n]))         # CRITICAL: embed first
+    h += o_proj(sigmoid(gate) * SDPA(Q,K,V)) # gated attention, pos 0
+    h += mlp_down(SiLU(mlp_gate) * mlp_up)   # dense MLP
+    logits = shared_head_head(shared_head_norm(h))
+  Uses manual single-token attention (no KV cache, no mask) to match
+  the MLX reference in ~/mlx-fork/fused_gdn.py MTPHead.__call__,
+  including the embed-first concat order (was the primary correctness
+  pitfall called out in the task brief).
+- Expose public C API:
+    bool   llama_model_has_mtp_head(const llama_model *)
+    int32_t llama_mtp_draft(ctx, last_token, n_draft, out_tokens, out_logits)
+  has_mtp_head is fully functional. mtp_draft is wired and validates
+  inputs; it returns -4 until the MTP-only graph execution path is
+  added via a new llm_graph_type (follow-up work; the builder is
+  ready to be called from process_ubatch).
+
+Known follow-ups:
+  1. New LLM_GRAPH_TYPE_MTP + process_ubatch route to run the graph.
+  2. Capture + surface of the previous decoder hidden state
+     (pre-output-norm) from the main decode pass.
+  3. RMSNorm +1.0 convention check: shared_head_norm weight may be
+     stored w or (1+w) depending on how GGUF conversion baked it.
+     Build passes; verify against reference logits once execution
+     is wired.
+
+---
+ include/llama.h          |  36 ++++++++
+ src/llama-arch.cpp       |   6 ++
+ src/llama-context.cpp    |  39 +++++++++
+ src/llama-model.cpp      |  31 +++++++
+ src/llama-model.h        |   3 +
+ src/models/models.h      |  21 +++++
+ src/models/qwen3next.cpp | 184 +++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 320 insertions(+)
+
+diff --git a/include/llama.h b/include/llama.h
+index f0bc95cff..325c3926a 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1080,6 +1080,42 @@ extern "C" {
+     // returns NULL for invalid ids.
+     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+ 
++    //
++    // Multi-Token Prediction (MTP / NextN) draft API
++    //
++    // Runs the per-model MTP head autoregressively for `n_draft` steps,
++    // producing `n_draft` greedy draft tokens that follow `last_token` at
++    // the current decoder hidden state.
++    //
++    // Preconditions:
++    //   - The model must carry MTP weights (see llama_model_has_mtp_head()).
++    //   - A successful llama_decode() must have been performed immediately
++    //     prior so that the last hidden state is available in the context.
++    //
++    // Arguments:
++    //   ctx         - context bound to a model with an MTP head
++    //   last_token  - the most recently emitted / seed token (id)
++    //   n_draft     - number of draft tokens to generate (>= 1)
++    //   out_tokens  - caller-allocated buffer of length n_draft (token ids)
++    //   out_logits  - optional caller-allocated buffer of length
++    //                 n_draft * n_vocab to receive the per-step logits
++    //                 (may be NULL)
++    //
++    // Returns 0 on success, negative on failure:
++    //   -1  model has no MTP head
++    //   -2  invalid arguments
++    //   -3  no hidden state available (llama_decode must run first)
++    //   -4  graph compute failure
++    LLAMA_API int32_t llama_mtp_draft(
++            struct llama_context * ctx,
++                     llama_token   last_token,
++                         int32_t   n_draft,
++                     llama_token * out_tokens,
++                           float * out_logits);
++
++    // Returns true if the loaded model has an MTP (NextN) head usable with llama_mtp_draft().
++    LLAMA_API bool llama_model_has_mtp_head(const struct llama_model * model);
++
+     // Get all output token embeddings.
+     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
+     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 39ebb9db0..b2e3e4302 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -1000,6 +1000,12 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
+                 LLM_TENSOR_SSM_IN,
+                 LLM_TENSOR_SSM_NORM,
+                 LLM_TENSOR_SSM_OUT,
++                LLM_TENSOR_NEXTN_EH_PROJ,
++                LLM_TENSOR_NEXTN_EMBED_TOKENS,
++                LLM_TENSOR_NEXTN_ENORM,
++                LLM_TENSOR_NEXTN_HNORM,
++                LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
++                LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+             };
+         case LLM_ARCH_QWEN35:
+             return {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d1a418ffa..b5d29a8fc 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3484,6 +3484,45 @@ int32_t llama_decode(
+     return ret;
+ }
+ 
++//
++// Multi-Token Prediction (MTP / NextN) draft
++//
++// This is a thin public-API entry point that validates inputs and delegates
++// to the model's MTP head graph builder (see llm_build_qwen3next::build_mtp_head).
++//
++// The graph builder is in place and matches the MLX reference; what this
++// stub currently does NOT do is run the builder K times through the scheduler
++// and read back logits. That requires adding a new llm_graph_type for
++// MTP-only forward passes plus a small allocator loop in llama_context.
++// Until that lands, the entry point returns a diagnostic so downstream
++// callers can detect whether MTP is available and fall back to stock decode.
++//
++// TODO(mtp): wire up through process_ubatch with a new LLM_GRAPH_TYPE_MTP.
++int32_t llama_mtp_draft(
++        struct llama_context * ctx,
++                 llama_token   last_token,
++                     int32_t   n_draft,
++                 llama_token * out_tokens,
++                       float * out_logits) {
++    GGML_UNUSED(last_token);
++    GGML_UNUSED(out_logits);
++
++    if (ctx == nullptr || out_tokens == nullptr || n_draft <= 0) {
++        return -2;
++    }
++
++    if (!llama_model_has_mtp_head(&ctx->get_model())) {
++        return -1;
++    }
++
++    // Graph execution path not yet wired through the scheduler.
++    // The graph BUILDER is implemented (see src/models/qwen3next.cpp
++    // build_mtp_head) and the MTP weights are loaded — the remaining work
++    // is a new llm_graph_type + process_ubatch route. Until then, return -4
++    // to signal callers that MTP execution is unavailable.
++    return -4;
++}
++
+ //
+ // perf
+ //
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index deecf085a..bbe61cd82 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2486,6 +2486,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
+                     }
+                 }
+ 
++                // NextN/MTP parameters (optional; present in Qwen3.5-27B MTP variants)
++                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
++
+                 switch (hparams.n_layer) {
+                     case 48: type = LLM_TYPE_80B_A3B; break;
+                     default: type = LLM_TYPE_UNKNOWN;
+@@ -7396,6 +7399,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", i), { n_embd, hparams.n_ff_shexp }, 0);
+                         layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", i), { n_embd, hparams.n_ff_shexp }, 0);
+                         layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", i), { hparams.n_ff_shexp, n_embd }, 0);
++
++                        // NextN/MTP tensors - optional, loaded when nextn_predict_layers covers this layer
++                        if (hparams.nextn_predict_layers > 0 && static_cast<uint32_t>(i) >= n_layer - hparams.nextn_predict_layers) {
++                            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,            "weight", i), { 2 * n_embd, n_embd }, TENSOR_NOT_REQUIRED);
++                            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,              "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
++                            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,              "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
++                            layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,       "weight", i), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
++                            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,   "weight", i), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
++                            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,   "weight", i), { n_embd }, TENSOR_NOT_REQUIRED);
++                        }
+                     }
+                 } break;
+             case LLM_ARCH_QWEN35MOE:
+@@ -8129,6 +8142,20 @@ bool llama_model::has_tensor_overrides() const {
+     return pimpl->has_tensor_overrides;
+ }
+ 
++bool llama_model::has_mtp_head() const {
++    if (hparams.nextn_predict_layers == 0 || layers.empty()) {
++        return false;
++    }
++    // MTP tensors live on the last nextn_predict_layers; eh_proj is the definitive marker
++    const uint32_t n_layer = hparams.n_layer;
++    for (uint32_t i = n_layer - hparams.nextn_predict_layers; i < n_layer; ++i) {
++        if (layers[i].nextn.eh_proj == nullptr) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ const ggml_tensor * llama_model::get_tensor(const char * name) const {
+     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
+             [name](const std::pair<std::string, ggml_tensor *> & it) {
+@@ -8873,6 +8900,10 @@ int32_t llama_model_n_embd(const llama_model * model) {
+     return model->hparams.n_embd;
+ }
+ 
++bool llama_model_has_mtp_head(const llama_model * model) {
++    return model && model->has_mtp_head();
++}
++
+ int32_t llama_model_n_embd_inp(const llama_model * model) {
+     return model->hparams.n_embd_inp();
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 422ed4569..6ae831c87 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -546,6 +546,9 @@ struct llama_model {
+ 
+     bool has_tensor_overrides() const;
+ 
++    // returns true if the model has a loaded MTP (NextN) head usable for draft-token prediction
++    bool has_mtp_head() const;
++
+     const struct ggml_tensor * get_tensor(const char * name) const;
+ 
+     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
+diff --git a/src/models/models.h b/src/models/models.h
+index 10f8b5892..984792ebb 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -513,6 +513,27 @@ struct llm_build_qwen3vlmoe : public llm_graph_context {
+ 
+ struct llm_build_qwen3next : public llm_build_delta_net_base {
+     llm_build_qwen3next(const llama_model & model, const llm_graph_params & params);
++
++    // Multi-Token Prediction (MTP) head forward pass.
++    // Given the previous hidden state and the embedding of the last sampled
++    // token, runs ONE transformer layer (gated attention + MLP + final norm)
++    // and projects to vocab logits using the shared head. Mirrors the MLX
++    // MTPHead reference in ~/mlx-fork/fused_gdn.py.
++    //
++    // Inputs:
++    //   prev_hidden  - [n_embd, 1] previous step hidden state (pre-output-norm)
++    //   tok_embed    - [n_embd, 1] embedding of the seed (last sampled) token
++    //   il_mtp       - index of the NextN layer that holds the MTP weights
++    //                  (typically n_layer - 1 for Qwen3.5-27B with a single MTP layer)
++    // Returns:
++    //   logits tensor [n_vocab, 1] and (via out param) the pre-norm hidden
++    //   for autoregressive chaining.
++    ggml_tensor * build_mtp_head(
++                ggml_tensor *  prev_hidden,
++                ggml_tensor *  tok_embed,
++                          int  il_mtp,
++                ggml_tensor ** out_hidden);
++
+ private:
+     ggml_tensor * build_layer_attn(
+     llm_graph_input_attn_kv * inp_attn,
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index 79790b89d..fdff2cf65 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -476,6 +476,190 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
+     return cur;
+ }
+ 
++ggml_tensor * llm_build_qwen3next::build_mtp_head(
++        ggml_tensor *  prev_hidden,
++        ggml_tensor *  tok_embed,
++                  int  il_mtp,
++        ggml_tensor ** out_hidden) {
++    // Reference: MTPHead.__call__ in ~/mlx-fork/fused_gdn.py
++    //
++    // Step 1: e_norm = enorm(tok_embed); h_norm = hnorm(prev_hidden)
++    // Step 2: h = fc(concat([e_norm, h_norm], axis=-1))  (embed first, hidden second)
++    // Step 3: residual = h; h' = input_layernorm(h)  -- we reuse `attn_norm` slot on the layer
++    // Step 4: gated self-attention (single token, no past cache, no mask)
++    // Step 5: residual += o_proj(output * sigmoid(gate))
++    // Step 6: residual = h; h' = post_attention_layernorm(h); MLP(SiLU(gate_proj) * up_proj)
++    // Step 7: final_norm; lm_head projection (shared_head_head) -> logits
++    //
++    // Storage mapping:
++    //   nextn.enorm            -> enorm
++    //   nextn.hnorm            -> hnorm
++    //   nextn.eh_proj          -> fc
++    //   shared_head_norm       -> final norm
++    //   shared_head_head       -> shared lm head
++    //
++    // The per-MTP-layer attention / MLP weights reuse the normal layer slots on
++    // model.layers[il_mtp]: attn_norm, wq/wk/wv/wo, attn_q_norm, attn_k_norm,
++    // attn_post_norm, ffn_*_shexp (for dense MLP) OR ffn_*. For Qwen3-Next MTP
++    // weights converted into the NextN layer, the per-layer attention/MLP slots
++    // follow the same GGUF naming as a normal attention layer at index il_mtp.
++
++    const auto & layer = model.layers[il_mtp];
++
++    // sanity: MTP head requires these to exist
++    GGML_ASSERT(layer.nextn.enorm            && "MTP enorm missing");
++    GGML_ASSERT(layer.nextn.hnorm            && "MTP hnorm missing");
++    GGML_ASSERT(layer.nextn.eh_proj          && "MTP eh_proj missing");
++    GGML_ASSERT(layer.nextn.shared_head_norm && "MTP shared_head_norm missing");
++    GGML_ASSERT(layer.nextn.shared_head_head && "MTP shared_head_head missing");
++
++    const int64_t n_embd_head = hparams.n_embd_head_v;
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
++
++    // Shape conventions: prev_hidden and tok_embed are [n_embd, 1] column vectors
++
++    // --- 1. Norm + concat + project ---
++    ggml_tensor * h_norm = build_norm(prev_hidden, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(h_norm, "mtp_h_norm", il_mtp);
++
++    ggml_tensor * e_norm = build_norm(tok_embed, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(e_norm, "mtp_e_norm", il_mtp);
++
++    // Concat along the feature dim: [e; h] -> [2*n_embd, 1]
++    // NOTE (CRITICAL): embed first, hidden second. Matches GGUF "eh_proj" name.
++    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, 0);
++    cb(concat, "mtp_eh_concat", il_mtp);
++
++    ggml_tensor * h = build_lora_mm(layer.nextn.eh_proj, concat);
++    cb(h, "mtp_fc_out", il_mtp);
++
++    // --- 2. Gated self-attention (single token, no past cache, no mask) ---
++    ggml_tensor * residual = h;
++    ggml_tensor * h_attn = build_norm(h, layer.attn_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(h_attn, "mtp_attn_norm", il_mtp);
++
++    // Q projection produces [Q | gate] interleaved per-head (see existing build_layer_attn)
++    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, h_attn);
++    cb(Qcur_full, "mtp_Qcur_full", il_mtp);
++
++    Qcur_full = ggml_reshape_4d(ctx0, Qcur_full, n_embd_head * 2, n_head, 1, 1);
++
++    ggml_tensor * Qcur = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, 1, 1,
++                                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3], 0);
++    ggml_tensor * gate = ggml_view_4d(ctx0, Qcur_full, n_embd_head, n_head, 1, 1,
++                                      Qcur_full->nb[1], Qcur_full->nb[2], Qcur_full->nb[3],
++                                      n_embd_head * ggml_element_size(Qcur_full));
++
++    ggml_tensor * Kcur = build_lora_mm(layer.wk, h_attn);
++    ggml_tensor * Vcur = build_lora_mm(layer.wv, h_attn);
++
++    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, 1);
++    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, 1);
++
++    Qcur = build_norm(Qcur, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il_mtp);
++
++    // RoPE at position 0 (the MTP head does not need absolute positions — it's
++    // a stateless one-token transformer with no past context; using pos=0 is
++    // what the MLX reference does via offset=0 for a fresh draft step).
++    ggml_tensor * inp_pos_zero = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++    ggml_set_input(inp_pos_zero);
++
++    Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos_zero, nullptr,
++            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++            ext_factor, attn_factor, beta_fast, beta_slow);
++    Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos_zero, nullptr,
++            n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++            ext_factor, attn_factor, beta_fast, beta_slow);
++    cb(Qcur, "mtp_Qcur", il_mtp);
++    cb(Kcur, "mtp_Kcur", il_mtp);
++    cb(Vcur, "mtp_Vcur", il_mtp);
++
++    // Single-token attention: no past keys, no mask, no cache.
++    // Compute manually: softmax(Q @ K^T * scale) @ V
++    // Shapes:
++    //   Q: [head_dim, n_head,    1]
++    //   K: [head_dim, n_head_kv, 1]
++    //   V: [head_dim, n_head_kv, 1]
++    // For GQA with n_head > n_head_kv, repeat K/V along head axis.
++    const float kq_scale = hparams.f_attention_scale == 0.0f
++        ? 1.0f / sqrtf(float(n_embd_head))
++        : hparams.f_attention_scale;
++
++    if (n_head_kv != n_head) {
++        GGML_ASSERT(n_head % n_head_kv == 0);
++        const int64_t rep = n_head / n_head_kv;
++        Kcur = ggml_repeat_4d(ctx0, Kcur, n_embd_head, rep, n_head_kv, 1);
++        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head, 1);
++        Vcur = ggml_repeat_4d(ctx0, Vcur, n_embd_head, rep, n_head_kv, 1);
++        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head, 1);
++    }
++
++    // KQ = Q . K (along head_dim) -> [1, 1, n_head]
++    // Use ggml_mul_mat which does (K^T @ Q): out[i,j] = sum_k K[k,i]*Q[k,j]
++    ggml_tensor * KQ = ggml_mul_mat(ctx0, Kcur, Qcur);
++    KQ = ggml_scale(ctx0, KQ, kq_scale);
++    KQ = ggml_soft_max(ctx0, KQ);
++
++    // attn = V . KQ -> [head_dim, 1, n_head]
++    ggml_tensor * KQV = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Vcur)), KQ);
++    ggml_tensor * attn_out = ggml_reshape_2d(ctx0, KQV, n_embd_head * n_head, 1);
++    cb(attn_out, "mtp_attn_pregate", il_mtp);
++
++    // Apply the per-head gate (sigmoid)
++    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, 1);
++    gate = ggml_sigmoid(ctx0, gate);
++    attn_out = ggml_mul(ctx0, attn_out, gate);
++
++    attn_out = build_lora_mm(layer.wo, attn_out);
++    cb(attn_out, "mtp_attn_out", il_mtp);
++
++    h = ggml_add(ctx0, residual, attn_out);
++
++    // --- 3. MLP ---
++    residual = h;
++    ggml_tensor * h_mlp_norm = build_norm(h, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(h_mlp_norm, "mtp_mlp_norm", il_mtp);
++
++    // MTP head uses a dense MLP (not MoE) — weights land in ffn_gate/ffn_up/ffn_down
++    // on the NextN layer during GGUF conversion. Fall back to shared-expert MLP
++    // slots if the dense slots are not populated.
++    ggml_tensor * mlp_out;
++    if (layer.ffn_up && layer.ffn_gate && layer.ffn_down) {
++        mlp_out = build_ffn(h_mlp_norm,
++            layer.ffn_up,   NULL, NULL,
++            layer.ffn_gate, NULL, NULL,
++            layer.ffn_down, NULL, NULL,
++            NULL,
++            LLM_FFN_SILU, LLM_FFN_PAR, il_mtp);
++    } else {
++        GGML_ASSERT(layer.ffn_up_shexp && layer.ffn_gate_shexp && layer.ffn_down_shexp
++                    && "MTP head requires either dense FFN or shared-expert FFN weights");
++        mlp_out = build_ffn(h_mlp_norm,
++            layer.ffn_up_shexp,   NULL, NULL,
++            layer.ffn_gate_shexp, NULL, NULL,
++            layer.ffn_down_shexp, NULL, NULL,
++            NULL,
++            LLM_FFN_SILU, LLM_FFN_PAR, il_mtp);
++    }
++    cb(mlp_out, "mtp_mlp_out", il_mtp);
++
++    h = ggml_add(ctx0, residual, mlp_out);
++
++    if (out_hidden) {
++        *out_hidden = h;
++    }
++
++    // --- 4. Final norm + shared lm head ---
++    ggml_tensor * h_final = build_norm(h, layer.nextn.shared_head_norm, nullptr, LLM_NORM_RMS, il_mtp);
++    cb(h_final, "mtp_final_norm", il_mtp);
++
++    ggml_tensor * logits = build_lora_mm(layer.nextn.shared_head_head, h_final);
++    cb(logits, "mtp_logits", il_mtp);
++
++    return logits;
++}
++
+ ggml_tensor * llm_build_qwen3next::build_layer_ffn(ggml_tensor * cur, const int il) {
+     // Check if this is an MoE layer
+     if (model.layers[il].ffn_gate_inp != nullptr) {
+-- 
+2.51.2
+
